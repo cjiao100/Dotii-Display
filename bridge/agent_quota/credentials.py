@@ -1,8 +1,9 @@
 """Read-only credential helpers.
 
-Secrets are only ever read at runtime from the user's own sources (environment
-variables, the macOS Keychain, or files written by the official CLIs). They are
-never written, logged, or returned to the web UI. Use :func:`redact` when a
+Secrets are only ever read at runtime, read-only, from login files written by
+the agents' official CLIs (or the environment those tools document). Dotii has
+no credential settings of its own and never reads the Keychain or browser data.
+Secrets are never written, cached, logged, or returned to the web UI. Use :func:`redact` when a
 value has to be mentioned at all.
 """
 
@@ -12,8 +13,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,7 +22,6 @@ from typing import Any, Iterable
 from .base import STATUS_AUTH_ERROR, STATUS_ERROR, STATUS_UNAVAILABLE, QuotaError
 
 
-KEYCHAIN_SERVICE = "Dotii Agent Quota"
 USER_AGENT = "DotiiBridge-AgentQuota/1"
 
 
@@ -39,26 +37,6 @@ def scrub(text: str, secrets: Iterable[str | None]) -> str:
         if secret and len(secret) >= 6:
             text = text.replace(secret, redact(secret))
     return text
-
-
-def keychain_secret(account: str, service: str = KEYCHAIN_SERVICE) -> str | None:
-    """Read a generic password from the login Keychain (macOS only, read-only)."""
-    if sys.platform != "darwin":
-        return None
-    security = shutil.which("security") or "/usr/bin/security"
-    if not Path(security).exists():
-        return None
-    try:
-        completed = subprocess.run(
-            [security, "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return None
-    value = completed.stdout.strip()
-    return value or None
 
 
 def env_secret(*names: str) -> tuple[str | None, str]:

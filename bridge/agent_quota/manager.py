@@ -238,7 +238,8 @@ class AgentQuotaManager:
             if state.run_id:
                 continue
             if not state.detection.configured:
-                status = STATUS_UNAVAILABLE if provider.kind == "cli" else STATUS_NOT_CONFIGURED
+                # Installed but not logged in -> "未登录"; nothing found locally -> "未检测到".
+                status = STATUS_NOT_CONFIGURED if state.detection.available else STATUS_UNAVAILABLE
                 state.entry = empty_entry(provider.id, provider.name, status, state.detection.detail)
                 state.next_due = 0.0
                 continue

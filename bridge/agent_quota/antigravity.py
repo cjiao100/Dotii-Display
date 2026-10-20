@@ -133,13 +133,13 @@ class AntigravityProvider(QuotaProvider):
     def detect(self) -> Detection:
         path = self.executable()
         if not path:
-            return Detection(False, False, "未找到 agy CLI")
-        return Detection(True, True, f"agy CLI：{path}", "cli")
+            return Detection(False, False, "未检测到 agy CLI")
+        return Detection(True, True, f"已检测到 agy CLI（{path}）；登录状态由 agy 自己管理，开启后读取时确认", "cli")
 
     def fetch(self) -> QuotaResult:
         path = self.executable()
         if not path:
-            raise QuotaError("未找到 agy CLI", STATUS_UNAVAILABLE)
+            raise QuotaError("未检测到 agy CLI", STATUS_UNAVAILABLE)
         env = self._env()
         self._require_supported_version(path, env)
         try:

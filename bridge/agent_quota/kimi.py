@@ -4,28 +4,41 @@ Source: MoonshotAI/kimi-code packages/oauth/src/managed-usage.ts (the official
 CLI ``/usage`` implementation): ``GET {base}/usages`` with
 ``Authorization: Bearer <api key | OAuth access token>``. Read-only.
 
-Dotii never refreshes OAuth tokens: the official CLI rotates refresh tokens
-under a cross-process lock, so refreshing here could log the user out.
+Credentials are only read, at runtime, from the official Kimi Code CLI's own
+login files (``packages/oauth/src/storage.ts``, ``managed-kimi-code.ts``):
+
+- ``<KIMI_CODE_HOME or ~/.kimi-code>/credentials/kimi-code.json``: the default
+  slot, mainland-China login (auth.kimi.com / api.kimi.com).
+- ``<...>/credentials/kimi-code-env-<sha256[:16]>.json``: the scoped slot of a
+  global login (auth.kimi.ai / api.kimi.ai), named from
+  ``sha256(JSON.stringify({oauthHost, baseUrl}))``.
+- ``<KIMI_SHARE_DIR or ~/.kimi>/credentials/kimi-code.json``: archived Python CLI.
+
+Only ``access_token`` and ``expires_at`` are used. Nothing is written, logged or
+cached. Dotii never refreshes OAuth tokens: the official CLI rotates refresh
+tokens under a cross-process lock, so refreshing here could log the user out.
+An expired access token is reported as "not logged in" until the CLI renews it.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from pathlib import Path
 from typing import Any
 
 from .base import (
-    STATUS_AUTH_ERROR, STATUS_NOT_CONFIGURED,
+    STATUS_NOT_CONFIGURED,
     Detection, QuotaError, QuotaProvider, QuotaResult, QuotaWindow,
     as_number, parse_epoch, safe_text,
 )
-from .credentials import env_secret, http_get_json, keychain_secret, read_json_file
+from .credentials import find_executable, http_get_json, read_json_file
 
 
 BASE_URLS = {"cn": "https://api.kimi.com/coding/v1", "global": "https://api.kimi.ai/coding/v1"}
-KEYCHAIN_ACCOUNT = "kimi"
-ENV_KEY = "DOTII_KIMI_API_KEY"
+OAUTH_HOSTS = {"cn": "https://auth.kimi.com", "global": "https://auth.kimi.ai"}
 NEW_WINDOWS = (
     ("limit_5h", "5h", "5 小时"),
     ("limit_7d", "weekly", "7 天"),
@@ -41,13 +54,37 @@ TIME_UNITS = {
 }
 
 
-def credential_files() -> list[Path]:
-    files: list[Path] = []
-    code_home = os.environ.get("KIMI_CODE_HOME", "").strip()
-    files.append((Path(code_home).expanduser() if code_home else Path.home() / ".kimi-code") / "credentials" / "kimi-code.json")
-    share_dir = os.environ.get("KIMI_SHARE_DIR", "").strip()
-    files.append((Path(share_dir).expanduser() if share_dir else Path.home() / ".kimi") / "credentials" / "kimi-code.json")
-    return files
+def kimi_code_home() -> Path:
+    value = os.environ.get("KIMI_CODE_HOME", "").strip()
+    return Path(value).expanduser() if value else Path.home() / ".kimi-code"
+
+
+def legacy_share_dir() -> Path:
+    value = os.environ.get("KIMI_SHARE_DIR", "").strip()
+    return Path(value).expanduser() if value else Path.home() / ".kimi"
+
+
+def scoped_slot_name(oauth_host: str, base_url: str) -> str:
+    """Mirror of resolveKimiCodeOAuthKey() for a non-default (oauthHost, baseUrl)."""
+    material = json.dumps({"oauthHost": oauth_host, "baseUrl": base_url}, separators=(",", ":"))
+    return "kimi-code-env-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def credential_slots() -> list[tuple[str, Path]]:
+    """(region, file) candidates in lookup order. Paths only; nothing is read here."""
+    folder = kimi_code_home() / "credentials"
+    return [
+        ("cn", folder / "kimi-code.json"),
+        ("global", folder / (scoped_slot_name(OAUTH_HOSTS["global"], BASE_URLS["global"]) + ".json")),
+        ("cn", legacy_share_dir() / "credentials" / "kimi-code.json"),
+    ]
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
 
 
 def token_from_credentials(payload: Any, now: float | None = None) -> tuple[str | None, bool]:
@@ -178,47 +215,57 @@ class KimiProvider(QuotaProvider):
     default_interval = 120
     min_interval = 60
     timeout = 8.0
-    regions = ("cn", "global")
-    default_region = "cn"
+    regions = ("auto", "cn", "global")
+    default_region = "auto"
 
-    def _credential(self) -> tuple[str | None, str, bool]:
-        value, source = env_secret(ENV_KEY)
-        if value:
-            return value, source, False
-        value = keychain_secret(KEYCHAIN_ACCOUNT)
-        if value:
-            return value, "keychain", False
-        for path in credential_files():
-            if path.is_file():
-                token, expired = token_from_credentials(read_json_file(path))
-                if token:
-                    label = "~/" + str(path.relative_to(Path.home())) if str(path).startswith(str(Path.home())) else str(path)
-                    return token, f"file:{label}", expired
-        return None, "", False
+    def _credential(self) -> tuple[str | None, str, bool, str]:
+        """Return (token, source label, expired, region) from the CLI login files."""
+        wanted = self.region
+        expired_hit: tuple[str | None, str, bool, str] | None = None
+        for region, path in credential_slots():
+            if wanted in BASE_URLS and region != wanted:
+                continue
+            if not path.is_file():
+                continue
+            token, expired = token_from_credentials(read_json_file(path))
+            if not token:
+                continue
+            hit = (token, f"file:{_display_path(path)}", expired, region)
+            if not expired:
+                return hit
+            expired_hit = expired_hit or hit
+        return expired_hit or (None, "", False, wanted if wanted in BASE_URLS else "cn")
 
-    def base_url(self) -> str:
+    def cli_present(self) -> bool:
+        if kimi_code_home().is_dir() or (legacy_share_dir() / "credentials").is_dir():
+            return True
+        return bool(find_executable(["kimi"], extra=[kimi_code_home() / "bin" / "kimi"]))
+
+    @staticmethod
+    def base_url(region: str) -> str:
         override = os.environ.get("KIMI_CODE_BASE_URL", "").strip().rstrip("/")
         if override.startswith("https://"):
             return override
-        return BASE_URLS[self.region]
+        return BASE_URLS[region]
 
     def detect(self) -> Detection:
-        token, source, expired = self._credential()
+        token, source, expired, _region = self._credential()
+        if token and not expired:
+            return Detection(True, True, f"已读取 Kimi Code CLI 登录：{source}", source)
         if token:
-            detail = f"凭据来源：{source}" + ("（OAuth 已过期，请在 Kimi Code CLI 中重新登录）" if expired else "")
-            return Detection(True, True, detail, source)
-        return Detection(False, False, "未找到 Kimi Code 凭据（Keychain 账户 kimi，或 ~/.kimi-code/credentials）")
+            return Detection(True, False, "Kimi Code CLI 登录令牌已过期；打开 Kimi Code CLI 后会自动续期（Dotii 不会刷新令牌）", source)
+        if self.cli_present():
+            return Detection(True, False, "未登录：在 Kimi Code CLI 中运行 /login 后自动读取")
+        return Detection(False, False, "未检测到 Kimi Code CLI")
 
     def fetch(self) -> QuotaResult:
-        token, source, expired = self._credential()
-        if not token:
-            raise QuotaError("未配置 Kimi Code API Key 或 CLI 登录", STATUS_NOT_CONFIGURED)
-        if expired:
-            raise QuotaError("Kimi Code 登录已过期，请运行 Kimi Code CLI 重新登录（Dotii 不会刷新令牌）", STATUS_AUTH_ERROR)
+        token, source, expired, region = self._credential()
+        if not token or expired:
+            raise QuotaError("未登录 Kimi Code CLI（或登录令牌已过期）", STATUS_NOT_CONFIGURED)
         payload = http_get_json(
-            self.base_url() + "/usages", {"Authorization": f"Bearer {token}"}, self.timeout, secrets=[token],
+            self.base_url(region) + "/usages", {"Authorization": f"Bearer {token}"}, self.timeout, secrets=[token],
         )
         result = parse_usages_response(payload)
-        result.extra["region"] = self.region
+        result.extra["region"] = region
         result.extra["credential_source"] = source.split(":", 1)[0]
         return result

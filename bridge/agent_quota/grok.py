@@ -104,16 +104,25 @@ class GrokProvider(QuotaProvider):
         grok_home = Path(os.environ.get("GROK_HOME", "").strip() or Path.home() / ".grok").expanduser()
         return find_executable(["grok"], extra=[grok_home / "bin" / "grok"], env_name="DOTII_GROK_COMMAND")
 
+    @staticmethod
+    def auth_file() -> Path:
+        home = os.environ.get("GROK_HOME", "").strip()
+        return (Path(home).expanduser() if home else Path.home() / ".grok") / "auth.json"
+
     def detect(self) -> Detection:
+        # Only the existence of the CLI's own login file is checked; its contents
+        # are never read. The CLI uses (and refreshes) the token itself.
         path = self.executable()
         if not path:
-            return Detection(False, False, "未找到 grok CLI")
-        return Detection(True, True, f"grok CLI：{path}", "cli")
+            return Detection(False, False, "未检测到 grok CLI")
+        if not self.auth_file().is_file():
+            return Detection(True, False, "未登录：运行 grok login 后自动读取")
+        return Detection(True, True, f"已检测到 grok 登录（{path}）", "cli")
 
     def fetch(self) -> QuotaResult:
         path = self.executable()
         if not path:
-            raise QuotaError("未找到 grok CLI", STATUS_UNAVAILABLE)
+            raise QuotaError("未检测到 grok CLI", STATUS_UNAVAILABLE)
         deadline = time.monotonic() + self.timeout
         with StdioJsonRpc([path, "agent", "stdio"], cwd=Path.home(), env=child_env()) as client:
             try:

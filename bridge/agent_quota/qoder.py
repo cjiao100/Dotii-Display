@@ -132,13 +132,13 @@ class QoderProvider(QuotaProvider):
     def detect(self) -> Detection:
         path = self.executable()
         if not path:
-            return Detection(False, False, "未找到 qodercli")
-        return Detection(True, True, f"qodercli：{path}", "cli")
+            return Detection(False, False, "未检测到 qodercli")
+        return Detection(True, True, f"已检测到 qodercli（{path}）；登录状态由 qodercli 自己管理，开启后读取时确认", "cli")
 
     def fetch(self) -> QuotaResult:
         path = self.executable()
         if not path:
-            raise QuotaError("未找到 qodercli", STATUS_UNAVAILABLE)
+            raise QuotaError("未检测到 qodercli", STATUS_UNAVAILABLE)
         request_id = f"dotii-{uuid.uuid4().hex[:12]}"
         command = [path, "--print", "--output-format", "stream-json", "--input-format", "stream-json",
                    "--no-session-persistence", "--strict-mcp-config"]

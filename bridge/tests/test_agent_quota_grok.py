@@ -65,7 +65,11 @@ class GrokAcpTests(unittest.TestCase):
     def provider(self, mode, timeout=10.0):
         provider = GrokProvider()
         provider.timeout = timeout
-        patcher = mock.patch.dict("os.environ", {"DOTII_GROK_COMMAND": str(self.cli), "FAKE_ACP_MODE": mode})
+        grok_home = Path(self.folder.name) / "grok-home"
+        grok_home.mkdir(exist_ok=True)
+        (grok_home / "auth.json").write_text("{}", encoding="utf-8")  # mock login marker, no token
+        patcher = mock.patch.dict("os.environ", {"DOTII_GROK_COMMAND": str(self.cli), "FAKE_ACP_MODE": mode,
+                                                 "GROK_HOME": str(grok_home)})
         patcher.start()
         self.addCleanup(patcher.stop)
         return provider
@@ -90,6 +94,30 @@ class GrokAcpTests(unittest.TestCase):
         with self.assertRaises(QuotaError) as caught:
             self.provider("hang", timeout=1.5).fetch()
         self.assertEqual(caught.exception.status, "unavailable")
+
+    def test_login_detection_checks_only_auth_file_presence(self):
+        with temporary_directory() as folder:
+            grok_home = Path(folder) / ".grok"
+            grok_home.mkdir()
+            env = {"DOTII_GROK_COMMAND": str(self.cli), "GROK_HOME": str(grok_home)}
+            with mock.patch.dict("os.environ", env):
+                detection = GrokProvider().detect()
+                self.assertEqual((detection.available, detection.configured), (True, False))
+                self.assertIn("grok login", detection.detail)
+                auth = grok_home / "auth.json"
+                auth.write_text("{}", encoding="utf-8")
+                auth.chmod(0)  # unreadable: detection must not open it
+                try:
+                    detection = GrokProvider().detect()
+                finally:
+                    auth.chmod(0o600)
+                self.assertEqual((detection.available, detection.configured), (True, True))
+            with mock.patch.dict("os.environ", {"DOTII_GROK_COMMAND": str(Path(folder) / "missing"),
+                                                "GROK_HOME": str(grok_home), "PATH": ""}), \
+                    mock.patch("agent_quota.grok.find_executable", return_value=None):
+                detection = GrokProvider().detect()
+                self.assertEqual((detection.available, detection.configured, detection.detail),
+                                 (False, False, "未检测到 grok CLI"))
 
     def test_missing_cli_is_unavailable(self):
         provider = GrokProvider()

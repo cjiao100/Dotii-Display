@@ -81,7 +81,8 @@ class ZCodeParserTests(unittest.TestCase):
     def test_fetch_sends_raw_key_without_bearer(self):
         provider = ZCodeProvider({"region": "global"})
         fake_key = "fakeid.fakesecretvalue"
-        with mock.patch.dict("os.environ", {"DOTII_ZCODE_API_KEY": fake_key}, clear=False), \
+        with mock.patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+                                            "ANTHROPIC_AUTH_TOKEN": fake_key}, clear=True), \
                 mock.patch("agent_quota.zcode.http_get_json", return_value=fixture("zcode_quota_limit.json")) as get:
             entry = provider.fetch_quota()
         url, headers = get.call_args.args[0], get.call_args.args[1]
@@ -91,16 +92,34 @@ class ZCodeParserTests(unittest.TestCase):
 
     def test_missing_key_is_not_configured(self):
         provider = ZCodeProvider()
-        with mock.patch.dict("os.environ", {}, clear=True), \
-                mock.patch("agent_quota.zcode.keychain_secret", return_value=None):
-            self.assertFalse(provider.detect().configured)
+        with temporary_directory() as folder, mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            detection = provider.detect()
+            self.assertEqual((detection.available, detection.configured), (False, False))
+            self.assertEqual(detection.detail, "未检测到 ZCode")
             with self.assertRaises(QuotaError) as caught:
                 provider.fetch()
-        self.assertEqual(caught.exception.status, "not_configured")
+            self.assertEqual(caught.exception.status, "not_configured")
+            # An installed ZCode keeps its keys encrypted: detected, never decrypted.
+            (Path(folder) / ".zcode" / "v2").mkdir(parents=True)
+            (Path(folder) / ".zcode" / "v2" / "credentials.json").write_text(
+                json.dumps({"provider:builtin:zai": "enc:v1:AAAA.BBBB.CCCC"}), encoding="utf-8")
+            detection = provider.detect()
+            self.assertEqual((detection.available, detection.configured), (True, False))
+            self.assertIn("加密", detection.detail)
+
+    def test_no_manual_credential_sources_remain(self):
+        import agent_quota.zcode as zcode_module
+        self.assertFalse(hasattr(credentials, "keychain_secret"))
+        self.assertFalse(hasattr(zcode_module, "ENV_KEY"))
+        with temporary_directory() as folder, \
+                mock.patch.dict("os.environ", {"DOTII_ZCODE_API_KEY": "fakeid.fakesecret"}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            self.assertFalse(ZCodeProvider().detect().configured)
 
     def test_anthropic_token_only_used_for_zai_endpoints(self):
         provider = ZCodeProvider()
-        with mock.patch("agent_quota.zcode.keychain_secret", return_value=None):
+        with mock.patch("pathlib.Path.home", return_value=Path("/nonexistent-home")):
             with mock.patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "https://api.anthropic.com",
                                                 "ANTHROPIC_AUTH_TOKEN": "fake-token-1"}, clear=True):
                 self.assertFalse(provider.detect().configured)
@@ -118,7 +137,7 @@ class ZCodeParserTests(unittest.TestCase):
         for lookalike in ("https://evilz.ai", "https://z.ai.example.com", "https://notbigmodel.cn"):
             self.assertEqual(_region_from_base_url(lookalike), "", lookalike)
         provider = ZCodeProvider()
-        with mock.patch("agent_quota.zcode.keychain_secret", return_value=None):
+        with mock.patch("pathlib.Path.home", return_value=Path("/nonexistent-home")):
             with mock.patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "https://evilz.ai/api",
                                                 "ANTHROPIC_AUTH_TOKEN": "fake-token-1"}, clear=True):
                 self.assertFalse(provider.detect().configured)
@@ -215,35 +234,96 @@ class KimiParserTests(unittest.TestCase):
         self.assertEqual((token, expired), ("fake-value", False))
         self.assertEqual(token_from_credentials({"refresh_token": "x"}), (None, False))
 
-    def test_fetch_uses_bearer_and_region_and_never_refreshes_expired_token(self):
+    def _write_slot(self, home: Path, name: str, expires_at: int = 4102444800, token: str = "fake-oauth-value"):
+        creds = home / ".kimi-code" / "credentials"
+        creds.mkdir(parents=True, exist_ok=True)
+        (creds / name).write_text(json.dumps(
+            {"access_token": token, "refresh_token": "fake-refresh", "expires_at": expires_at,
+             "scope": "kimi-code", "token_type": "Bearer", "expires_in": 900}
+        ), encoding="utf-8")
+        return creds / name
+
+    def _env(self, home: Path):
+        return mock.patch.dict("os.environ", {"KIMI_CODE_HOME": str(home / ".kimi-code"),
+                                              "KIMI_SHARE_DIR": str(home / ".kimi")}, clear=True)
+
+    def test_global_slot_name_matches_official_cli(self):
+        from agent_quota.kimi import scoped_slot_name
+        import hashlib
+        expected = hashlib.sha256(
+            b'{"oauthHost":"https://auth.kimi.ai","baseUrl":"https://api.kimi.ai/coding/v1"}').hexdigest()[:16]
+        self.assertEqual(scoped_slot_name("https://auth.kimi.ai", "https://api.kimi.ai/coding/v1"),
+                         "kimi-code-env-" + expected)
+
+    def test_default_slot_is_mainland_and_never_leaks_token(self):
         with temporary_directory() as folder:
             home = Path(folder)
-            creds = home / ".kimi-code" / "credentials"
-            creds.mkdir(parents=True)
-            (creds / "kimi-code.json").write_text(json.dumps(
-                {"access_token": "fake-oauth-value", "refresh_token": "fake-refresh", "expires_at": 4102444800}
-            ), encoding="utf-8")
-            provider = KimiProvider({"region": "global"})
-            with mock.patch.dict("os.environ", {"KIMI_CODE_HOME": str(home / ".kimi-code")}, clear=True), \
-                    mock.patch("agent_quota.kimi.keychain_secret", return_value=None), \
+            self._write_slot(home, "kimi-code.json")
+            provider = KimiProvider()
+            with self._env(home), \
                     mock.patch("agent_quota.kimi.http_get_json", return_value=fixture("kimi_usages_new.json")) as get:
-                self.assertTrue(provider.detect().configured)
+                detection = provider.detect()
+                self.assertTrue(detection.configured)
+                self.assertNotIn("fake-oauth-value", detection.detail)
                 entry = provider.fetch_quota()
-            self.assertEqual(get.call_args.args[0], "https://api.kimi.ai/coding/v1/usages")
+            self.assertEqual(get.call_args.args[0], "https://api.kimi.com/coding/v1/usages")
             self.assertEqual(get.call_args.args[1], {"Authorization": "Bearer fake-oauth-value"})
             self.assertNotIn("fake-oauth-value", json.dumps(entry))
-            self.assertEqual(entry["extra"]["credential_source"], "file")
+            self.assertEqual((entry["extra"]["credential_source"], entry["extra"]["region"]), ("file", "cn"))
 
-            (creds / "kimi-code.json").write_text(json.dumps(
-                {"access_token": "fake-oauth-value", "expires_at": 1}
-            ), encoding="utf-8")
-            with mock.patch.dict("os.environ", {"KIMI_CODE_HOME": str(home / ".kimi-code")}, clear=True), \
-                    mock.patch("agent_quota.kimi.keychain_secret", return_value=None), \
-                    mock.patch("agent_quota.kimi.http_get_json") as get:
+    def test_global_login_slot_uses_kimi_ai(self):
+        from agent_quota.kimi import BASE_URLS, OAUTH_HOSTS, scoped_slot_name
+        with temporary_directory() as folder:
+            home = Path(folder)
+            self._write_slot(home, scoped_slot_name(OAUTH_HOSTS["global"], BASE_URLS["global"]) + ".json")
+            for region in ("auto", "global"):
+                with self._env(home), \
+                        mock.patch("agent_quota.kimi.http_get_json", return_value=fixture("kimi_usages_new.json")) as get:
+                    entry = KimiProvider({"region": region}).fetch_quota()
+                self.assertEqual(get.call_args.args[0], "https://api.kimi.ai/coding/v1/usages")
+                self.assertEqual(entry["extra"]["region"], "global")
+            with self._env(home):  # an explicit mainland pick does not borrow the global login
+                self.assertFalse(KimiProvider({"region": "cn"}).detect().configured)
+
+    def test_signed_out_expired_and_missing_are_not_errors(self):
+        with temporary_directory() as folder:
+            home = Path(folder)
+            provider = KimiProvider()
+            with self._env(home), mock.patch("agent_quota.kimi.find_executable", return_value=None):
+                detection = provider.detect()
+                self.assertEqual((detection.available, detection.configured), (False, False))
+                self.assertEqual(detection.detail, "未检测到 Kimi Code CLI")
+            (home / ".kimi-code").mkdir()
+            (home / ".kimi-code" / "region").write_text("mainland-cn\n", encoding="utf-8")
+            with self._env(home), mock.patch("agent_quota.kimi.find_executable", return_value=None):
+                detection = provider.detect()
+                self.assertEqual((detection.available, detection.configured), (True, False))
+                self.assertIn("未登录", detection.detail)
+            self._write_slot(home, "kimi-code.json", expires_at=1)
+            with self._env(home), mock.patch("agent_quota.kimi.http_get_json") as get:
+                detection = provider.detect()
+                self.assertEqual((detection.available, detection.configured), (True, False))
+                self.assertIn("过期", detection.detail)
                 with self.assertRaises(QuotaError) as caught:
                     provider.fetch()
+                get.assert_not_called()  # an expired token is never sent nor refreshed
+            self.assertEqual(caught.exception.status, "not_configured")
+            (home / ".kimi-code" / "credentials" / "kimi-code.json").write_text("{not json", encoding="utf-8")
+            with self._env(home):
+                self.assertFalse(provider.detect().configured)
+
+    def test_credential_files_are_never_modified(self):
+        with temporary_directory() as folder:
+            home = Path(folder)
+            path = self._write_slot(home, "kimi-code.json", expires_at=1)
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            with self._env(home), mock.patch("agent_quota.kimi.http_get_json") as get:
+                KimiProvider().detect()
+                with self.assertRaises(QuotaError):
+                    KimiProvider().fetch()
                 get.assert_not_called()
-            self.assertEqual(caught.exception.status, "auth_error")
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["kimi-code.json"])
 
 
 class _FakeProvider(QuotaProvider):
@@ -306,15 +386,17 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(entry["enabled"])
         self.assertEqual(provider.calls, 0)
 
-    def test_enabled_but_unconfigured_api_provider_reports_not_configured(self):
-        provider = _FakeProvider(Detection(False, False, "need key"))
+    def test_signed_out_vs_not_detected(self):
+        provider = _FakeProvider(Detection(True, False, "未登录"))
         manager = self.manager(provider)
         manager.update_provider("fake", {"enabled": True})
         manager.tick()
-        self.assertEqual(self.entry(manager)["status"], "not_configured")
-        provider.kind = "cli"
+        self.assertEqual((self.entry(manager)["status"], self.entry(manager)["error"]), ("not_configured", ""))
+        provider.detection = Detection(False, False, "未检测到")
+        manager.update_provider("fake", {"enabled": True})
         manager.tick()
-        self.assertEqual(self.entry(manager)["status"], "unavailable")
+        self.assertEqual((self.entry(manager)["status"], self.entry(manager)["error"]), ("unavailable", ""))
+        self.assertEqual(provider.calls, 0)
 
     def test_failures_are_isolated_and_keep_last_value_as_stale(self):
         good = _FakeProvider()

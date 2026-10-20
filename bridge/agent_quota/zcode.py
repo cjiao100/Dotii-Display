@@ -4,6 +4,13 @@ Source: zai-org/ZCode docs/bigmodel-coding-plan-usage-quota.md and the official
 zai-coding-plugins usage-query script. ``GET <host>/api/monitor/usage/quota/limit``
 is a read-only quota query. The raw API key is sent in ``authorization``
 *without* a ``Bearer`` prefix. The key is never used for inference.
+
+Credentials: Dotii no longer asks for a key. The ZCode desktop app keeps
+provider keys in ``~/.zcode/v2/credentials.json`` encrypted (``enc:v1:``,
+AES-256-GCM); Dotii does not decrypt them, so a ZCode install alone is shown
+as detected but not readable. The only automatic source is the environment
+the official Z.ai usage plugin reads (``ANTHROPIC_AUTH_TOKEN`` while
+``ANTHROPIC_BASE_URL`` points at Z.ai / BigModel).
 """
 
 from __future__ import annotations
@@ -18,13 +25,11 @@ from .base import (
     Detection, QuotaError, QuotaProvider, QuotaResult, QuotaWindow,
     as_number, parse_epoch, safe_text,
 )
-from .credentials import env_secret, http_get_json, keychain_secret
+from .credentials import env_secret, http_get_json
 
 
 QUOTA_PATH = "/api/monitor/usage/quota/limit"
 HOSTS = {"cn": "https://open.bigmodel.cn", "global": "https://api.z.ai"}
-KEYCHAIN_ACCOUNT = "zcode"
-ENV_KEY = "DOTII_ZCODE_API_KEY"
 UNIT_LABELS = {3: "小时", 5: "月", 6: "周"}
 TOKEN_TYPES = {"TOKENS_LIMIT", "CREDIT_LIMIT"}
 
@@ -126,12 +131,6 @@ class ZCodeProvider(QuotaProvider):
     default_region = "auto"
 
     def _credential(self) -> tuple[str | None, str]:
-        value, source = env_secret(ENV_KEY)
-        if value:
-            return value, source
-        value = keychain_secret(KEYCHAIN_ACCOUNT)
-        if value:
-            return value, "keychain"
         # The official Z.ai usage plugin reads ANTHROPIC_AUTH_TOKEN, but only
         # when Claude Code is pointed at a Z.ai / bigmodel endpoint.
         base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
@@ -152,16 +151,14 @@ class ZCodeProvider(QuotaProvider):
         app_present = (Path.home() / ".zcode").exists()
         if key:
             return Detection(True, True, f"凭据来源：{source}", source)
-        hint = "已检测到 ZCode 配置目录，" if app_present else ""
-        return Detection(
-            app_present, False,
-            f"{hint}未配置 GLM Coding Plan API Key（Keychain 服务“Dotii Agent Quota”，账户 zcode）",
-        )
+        if app_present:
+            return Detection(True, False, "已检测到 ZCode，但它的 API Key 加密保存，暂不支持自动读取")
+        return Detection(False, False, "未检测到 ZCode")
 
     def fetch(self) -> QuotaResult:
         key, _source = self._credential()
         if not key:
-            raise QuotaError("未配置 GLM Coding Plan API Key", STATUS_NOT_CONFIGURED)
+            raise QuotaError("未读取到 GLM Coding Plan 登录信息", STATUS_NOT_CONFIGURED)
         header_value = key.strip()
         if header_value.lower().startswith("bearer "):
             header_value = header_value[7:].strip()

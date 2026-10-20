@@ -643,12 +643,12 @@ function formatMinutes(value) {
 }
 
 const AGENT_STATUS_TEXT = {
-  ok: "正常", pending: "读取中", disabled: "已关闭", not_configured: "未配置",
-  unavailable: "不可用", auth_error: "需要登录", error: "异常",
+  ok: "正常", pending: "读取中", disabled: "已关闭", not_configured: "未登录",
+  unavailable: "未检测到", auth_error: "登录已失效", error: "异常",
 };
 const AGENT_STATUS_BADGE = {
   ok: "ready", pending: "running", disabled: "idle", not_configured: "idle",
-  unavailable: "idle", auth_error: "error", error: "error",
+  unavailable: "idle", auth_error: "idle", error: "error",
 };
 const AGENT_REGION_TEXT = { auto: "自动", cn: "国内", global: "国际" };
 
