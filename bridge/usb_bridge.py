@@ -1,69 +1,26 @@
 """Dotii USB transport. One owner per port; bounded CRC framed messages.
 
-Wire: DTU1 + little-endian uint32 JSON byte length + uint32 CRC32 + UTF-8 JSON.
+Wire: DTU1 + little-endian uint32 JSON byte length + uint32 CRC32 + UTF-8 JSON
+(framing and request/reply matching live in dtu_protocol, shared with BLE).
 Requests have id/op/token; responses echo id. No credentials enter diagnostics.
 Images are acknowledged 4096-byte chunks with ordered offsets and final CRC.
 """
 from __future__ import annotations
 
 import base64
-import json
-import struct
 import threading
 import time
 import zlib
 from collections import deque
 
-MAGIC = b"DTU1"
-MAX_FRAME = 2 * 1024 * 1024
-
-
-def encode_frame(payload):
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if not 0 < len(body) <= MAX_FRAME:
-        raise ValueError("USB frame too large")
-    return MAGIC + struct.pack("<II", len(body), zlib.crc32(body)) + body
-
-
-class FrameDecoder:
-    def __init__(self):
-        self.buffer = bytearray()
-        self.started = 0.0
-
-    def feed(self, data):
-        if self.buffer and time.monotonic() - self.started > 8:
-            self.buffer.clear()
-        if not self.buffer:
-            self.started = time.monotonic()
-        self.buffer.extend(data)
-        output = []
-        while True:
-            pos = self.buffer.find(MAGIC)
-            if pos < 0:
-                self.buffer[:] = self.buffer[-3:]
-                break
-            if pos:
-                del self.buffer[:pos]
-            if len(self.buffer) < 12:
-                break
-            length, crc = struct.unpack_from("<II", self.buffer, 4)
-            if not 0 < length <= MAX_FRAME:
-                del self.buffer[:4]
-                continue
-            if len(self.buffer) < 12 + length:
-                break
-            body = bytes(self.buffer[12:12 + length])
-            if zlib.crc32(body) != crc:
-                del self.buffer[:4]
-                continue
-            del self.buffer[:12 + length]
-            try:
-                item = json.loads(body)
-                if isinstance(item, dict):
-                    output.append(item)
-            except (ValueError, UnicodeDecodeError):
-                pass
-        return output
+from dtu_protocol import (  # noqa: F401  (re-exported for callers and tests)
+    MAGIC,
+    MAX_FRAME,
+    DtuSession,
+    FrameDecoder,
+    encode_frame,
+    handle_bambu_event,
+)
 
 
 class UsbBridge:
@@ -77,7 +34,7 @@ class UsbBridge:
         self.released.set()
         self.worker = None
         self.serial = None
-        self.seq = 0
+        self.session = DtuSession(lambda: self.server.token, lambda item: handle_bambu_event(self.server, item))
         self.decoder = FrameDecoder()
         self.jobs = deque()
         self.state = {"state": "disconnected", "port": "", "device_id": "", "firmware": "", "last_sync": 0, "wifi": False, "wifi_bridge": False, "detail": "", "provision_state": "idle"}
@@ -119,31 +76,22 @@ class UsbBridge:
             self.jobs.append((ssid, password, preserve_password))
             self.state["provision_state"] = "writing"
 
+    @property
+    def seq(self):
+        return self.session.seq
+
     def _exchange(self, op, **payload):
-        self.seq += 1
-        seq = self.seq
-        packet = {"id": seq, "op": op, "token": self.server.token, **payload}
+        seq, packet = self.session.request(op, **payload)
         self.serial.write(encode_frame(packet))
         deadline = time.monotonic() + 6
         while time.monotonic() < deadline:
             if self.stop_event.is_set() or self.paused.is_set():
                 raise OSError("interrupted")
-            reply = None
-            for item in self.decoder.feed(self.serial.read(max(1, min(self.serial.in_waiting, 65536)))):
-                if item.get("event") == "bambu_command":
-                    # Never replay a command after a disconnect or retry it automatically.
-                    try:
-                        self.server.bambu.command(item.get("action"))
-                    except (OSError, ValueError):
-                        pass
-                elif item.get("id") == seq:
-                    reply = item
-            # A control event can share one USB read with the ACK. Consume all
-            # decoded frames before returning, or that command would be lost.
+            items = self.decoder.feed(self.serial.read(max(1, min(self.serial.in_waiting, 65536))))
+            # Events (Bambu buttons) are delivered once and never replayed.
+            reply = self.session.dispatch(items, seq)
             if reply is not None:
-                if not reply.get("ok"):
-                    raise ValueError(str(reply.get("error", "device_error")))
-                return reply
+                return self.session.check(reply)
         raise TimeoutError("firmware_update_required")
 
     def _image(self, kind, revision, body):
@@ -216,7 +164,7 @@ class UsbBridge:
                         self.update(provision_state="connecting")
                         break  # firmware restarts; reconnect without retaining the password
                     snapshot = self._sync()
-                    if self.server.connections.read()["mode"] != "wifi":
+                    if self.server.connections.read()["mode"] in ("auto", "usb"):
                         custom = snapshot.get("custom", {})
                         bambu = snapshot.get("bambu", {})
                         for kind, available, revision in (
