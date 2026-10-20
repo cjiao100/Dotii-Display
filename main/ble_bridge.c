@@ -54,6 +54,7 @@
 #define CONN_LATENCY 0
 #define CONN_TIMEOUT 600   /* 6 s in 10 ms units */
 #define LINK_TUNE_DELAY_MS 1000
+#define SECURITY_DELAY_MS 200
 
 static const char *TAG = "ble_bridge";
 static uint8_t s_own_addr_type;
@@ -78,6 +79,13 @@ typedef struct {
     int mtu_request_rc;
     bool encrypted;
     bool bonded;
+    int security_rc;          /* last ble_gap_security_initiate() result */
+    int enc_status;           /* last ENC_CHANGE status (0 = encrypted) */
+    uint16_t enc_changes;
+    uint16_t enc_failures;
+    uint16_t security_requests;
+    uint16_t repeat_pairings;
+    uint16_t bond_resets;     /* local bond dropped after the peer lost its keys */
     uint32_t rx_packets;
     uint32_t rx_bytes;
     uint32_t seq_gaps;
@@ -110,6 +118,8 @@ static dtu_stream_t s_stream;
 static QueueHandle_t s_frames;
 static SemaphoreHandle_t s_tx_lock;
 static struct ble_npl_callout s_link_callout;
+static struct ble_npl_callout s_security_callout;
+static bool s_bond_reset_done;
 static data_stats_t s_stats;
 /* Only the host task touches the RX scratch buffer and only the TX lock owner
    touches the TX one; both stay out of internal RAM. */
@@ -518,6 +528,13 @@ void ble_bridge_fill_diag(cJSON *object)
         cJSON_AddNumberToObject(ble, "conn_update_rc", s_stats.conn_update_rc);
         cJSON_AddNumberToObject(ble, "phy_request_rc", s_stats.phy_request_rc);
         cJSON_AddNumberToObject(ble, "mtu_request_rc", s_stats.mtu_request_rc);
+        cJSON_AddNumberToObject(ble, "security_rc", s_stats.security_rc);
+        cJSON_AddNumberToObject(ble, "security_requests", s_stats.security_requests);
+        cJSON_AddNumberToObject(ble, "enc_status", s_stats.enc_status);
+        cJSON_AddNumberToObject(ble, "enc_changes", s_stats.enc_changes);
+        cJSON_AddNumberToObject(ble, "enc_failures", s_stats.enc_failures);
+        cJSON_AddNumberToObject(ble, "repeat_pairings", s_stats.repeat_pairings);
+        cJSON_AddNumberToObject(ble, "bond_resets", s_stats.bond_resets);
         cJSON_AddNumberToObject(ble, "rx_packets", s_stats.rx_packets);
         cJSON_AddNumberToObject(ble, "rx_bytes", s_stats.rx_bytes);
         cJSON_AddNumberToObject(ble, "seq_gaps", s_stats.seq_gaps);
@@ -647,6 +664,27 @@ static void request_data_length(uint16_t conn_handle)
     if (s_stats.dle_request_rc != 0) ESP_LOGW(TAG, "Data length request failed: %d", s_stats.dle_request_rc);
 }
 
+/* Peripheral-initiated security: macOS does not start pairing by itself when a
+   CCCD write fails with Insufficient Encryption, so ask for it (Security
+   Request, or encryption with the stored LTK when already bonded). */
+static void request_security(uint16_t conn_handle)
+{
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0 || desc.sec_state.encrypted) return;
+    s_stats.security_requests++;
+    s_stats.security_rc = ble_gap_security_initiate(conn_handle);
+    if (s_stats.security_rc != 0 && s_stats.security_rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "Security request failed: %d", s_stats.security_rc);
+    }
+}
+
+static void security_timer(struct ble_npl_event *event)
+{
+    (void)event;
+    request_security(s_conn_handle);
+}
+
 /* Runs on the NimBLE host task a moment after connecting so the central has
    finished its own MTU exchange and service discovery first. */
 static void tune_link(struct ble_npl_event *event)
@@ -654,6 +692,8 @@ static void tune_link(struct ble_npl_event *event)
     (void)event;
     const uint16_t conn_handle = s_conn_handle;
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    /* Second chance if the early security request was ignored or raced. */
+    if (!s_stats.encrypted && s_stats.security_requests < 2) request_security(conn_handle);
     const struct ble_gap_upd_params params = {
         .itvl_min = CONN_ITVL_MIN,
         .itvl_max = CONN_ITVL_MAX,
@@ -688,11 +728,14 @@ static void session_begin(uint16_t conn_handle)
     s_stats.queue_drops = queue_drops;
     s_stats.mtu = ble_att_mtu(conn_handle);
     reset_data_channel();
+    s_bond_reset_done = false;
+    ble_npl_callout_reset(&s_security_callout, ble_npl_time_ms_to_ticks32(SECURITY_DELAY_MS));
     ble_npl_callout_reset(&s_link_callout, ble_npl_time_ms_to_ticks32(LINK_TUNE_DELAY_MS));
 }
 
 static void session_end(void)
 {
+    ble_npl_callout_stop(&s_security_callout);
     ble_npl_callout_stop(&s_link_callout);
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_tx_subscribed = false;
@@ -730,18 +773,47 @@ static int gap_event(struct ble_gap_event *event, void *argument)
         s_stats.mtu = event->mtu.value;
         ESP_LOGI(TAG, "Bluetooth MTU updated: %d", event->mtu.value);
         return 0;
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "Bluetooth encryption changed: %d", event->enc_change.status);
-        if (event->enc_change.status == 0) {
-            struct ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        const int status = event->enc_change.status;
+        const uint16_t conn_handle = event->enc_change.conn_handle;
+        s_stats.enc_changes++;
+        s_stats.enc_status = status;
+        ESP_LOGI(TAG, "Bluetooth encryption changed: %d", status);
+        struct ble_gap_conn_desc desc;
+        if (status == 0) {
+            if (ble_gap_conn_find(conn_handle, &desc) == 0) {
                 s_stats.encrypted = desc.sec_state.encrypted;
                 s_stats.bonded = desc.sec_state.bonded;
             }
             /* Some centrals reset or reject DLE across (re-)encryption. */
-            request_data_length(event->enc_change.conn_handle);
+            request_data_length(conn_handle);
+        } else {
+            s_stats.enc_failures++;
+            s_stats.encrypted = false;
+            /* The central forgot its keys (e.g. "Forget this device" on the Mac)
+               while we still hold a bond: drop ours once and pair afresh. */
+            if (status == BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING) && !s_bond_reset_done &&
+                ble_gap_conn_find(conn_handle, &desc) == 0) {
+                s_bond_reset_done = true;
+                s_stats.bond_resets++;
+                ESP_LOGW(TAG, "Peer lost its bond; deleting local bond and re-pairing");
+                (void)ble_store_util_delete_peer(&desc.peer_id_addr);
+                request_security(conn_handle);
+            }
         }
         return 0;
+    }
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        /* The peer re-pairs while we still hold an old bond (stale on our side):
+           delete it and let pairing continue. */
+        struct ble_gap_conn_desc desc;
+        s_stats.repeat_pairings++;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            (void)ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        ESP_LOGW(TAG, "Repeat pairing: old bond deleted");
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
     case BLE_GAP_EVENT_CONN_UPDATE:
         if (event->conn_update.status == 0) {
             struct ble_gap_conn_desc desc;
@@ -795,8 +867,10 @@ esp_err_t ble_bridge_prepare(void)
     if (error != ESP_OK) return error;
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    /* Just Works LE Secure Connections with bonding; no MITM (no display/keys). */
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
@@ -812,6 +886,7 @@ esp_err_t ble_bridge_prepare(void)
     if (s_frames == NULL || s_tx_lock == NULL) return ESP_ERR_NO_MEM;
     dtu_stream_init(&s_stream, DATA_MAX_FRAME, frame_alloc, heap_caps_free, deliver_frame, NULL);
     ble_npl_callout_init(&s_link_callout, nimble_port_get_dflt_eventq(), tune_link, NULL);
+    ble_npl_callout_init(&s_security_callout, nimble_port_get_dflt_eventq(), security_timer, NULL);
     s_prepared = true;
     ESP_LOGI(TAG, "Bluetooth controller reserved");
     return ESP_OK;
