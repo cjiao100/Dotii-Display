@@ -50,6 +50,11 @@
         <span>Dotii</span>
         <span class="module-meta" id="dotii-nav-state"><span data-i18n="读取中">读取中</span></span>
       </button>
+      <button class="module-tab" type="button" data-panel="agents" aria-selected="false">
+        <span class="nav-icon agents-icon" aria-hidden="true"></span>
+        <span><span data-i18n="Agent 额度">Agent 额度</span></span>
+        <span class="module-meta" id="agents-nav-state"><span data-i18n="读取中">读取中</span></span>
+      </button>
       <button class="module-tab system-tab" type="button" data-panel="system" aria-selected="false">
         <span class="nav-icon settings-icon" aria-hidden="true"></span>
         <span><span data-i18n="设置">设置</span></span>
@@ -466,6 +471,18 @@
             </label>
           </div>
         </section>
+      </section>
+
+      <section class="panel" id="panel-agents" aria-labelledby="agents-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="agents-heading"><span data-i18n="Agent 额度">Agent 额度</span></h2>
+            <p><span data-i18n="查看各 AI 编程 Agent 的套餐额度。数据只在本机管理中心显示，不会发送到 Dotii。">查看各 AI 编程 Agent 的套餐额度。数据只在本机管理中心显示，不会发送到 Dotii。</span></p>
+          </div>
+          <button class="quiet-button" id="agent-quota-refresh" type="button"><span data-i18n="全部刷新">全部刷新</span></button>
+        </div>
+        <div class="agent-quota-grid" id="agent-quota-grid" aria-live="polite"></div>
+        <p class="agent-quota-note"><span data-i18n="凭据只在运行时从本机读取（环境变量、macOS 钥匙串或官方 CLI 的登录文件），不会保存到 Dotii 配置中。">凭据只在运行时从本机读取（环境变量、macOS 钥匙串或官方 CLI 的登录文件），不会保存到 Dotii 配置中。</span></p>
       </section>
 
       <section class="panel" id="panel-system" aria-labelledby="system-heading" hidden>

@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from codex_app_server import probe_app_server, run_collector
+from agent_quota import AgentQuotaConfigStore, AgentQuotaManager, default_providers
 from bambu_client import BambuConfigStore, BambuService
 from bluetooth_bridge import BluetoothBridge
 from firmware_flasher import FirmwareFlasher
@@ -1173,6 +1174,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "wifi_data_last_seen": self.bridge.wifi_data_seen.get(self.bridge.connections.read()["device_id"], 0),
             "bluetooth": self.bridge.bluetooth.snapshot(),
             "firmware": self.bridge.firmware.snapshot(),
+            # Computer-side only: agent quotas are never added to the schema v1
+            # snapshot that the firmware reads.
+            "agent_quota": (
+                self.bridge.agent_quota.snapshot() if self.bridge.agent_quota is not None
+                else {"providers": [], "generated_at_epoch": int(time.time())}
+            ),
             "modules": [
                 {"id": "codex", "name": "Codex", "enabled": snapshot["modules"]["codex"], "available": True, "locked": False},
                 {"id": "bambu", "name": "Bambu", "enabled": snapshot["modules"]["bambu"], "available": True, "locked": False},
@@ -1286,6 +1293,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result["collector"] = self.bridge.runtime.snapshot()
                 self.bridge.codex_check.write(result)
                 self._send_json(HTTPStatus.OK, result)
+            except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path in {"/api/v1/admin/agent-quota/provider", "/api/v1/admin/agent-quota/refresh"}:
+            if self._deny_nonlocal():
+                return
+            try:
+                payload = self._read_admin_action()
+                manager = self.bridge.agent_quota
+                if manager is None:
+                    raise ValueError("Agent 额度功能未启用")
+                if path.endswith("/provider"):
+                    provider_id = payload.pop("id", None)
+                    if not isinstance(provider_id, str):
+                        raise ValueError("id is required")
+                    manager.update_provider(provider_id, payload)
+                else:
+                    if set(payload) - {"id"}:
+                        raise ValueError("refresh only accepts id")
+                    provider_id = payload.get("id")
+                    if provider_id is not None and not isinstance(provider_id, str):
+                        raise ValueError("id must be a string")
+                    manager.request_refresh(provider_id)
+                self._send_json(HTTPStatus.OK, {"ok": True, "agent_quota": manager.snapshot()})
             except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -1554,6 +1585,7 @@ class BridgeServer(ThreadingHTTPServer):
         application_folder: Path,
         codex_command: str | None,
         host_parent_pid: int = 0,
+        agent_quota: AgentQuotaManager | None = None,
     ) -> None:
         super().__init__(address, BridgeHandler)
         self.store = store
@@ -1574,6 +1606,7 @@ class BridgeServer(ThreadingHTTPServer):
         self.application_folder = application_folder
         self.codex_command = codex_command
         self.host_parent_pid = host_parent_pid
+        self.agent_quota = agent_quota
         self.connections = ConnectionSettings(runtime_folder / "connection.json")
         self.usb = UsbBridge(self)
         self.wifi_seen = {}
@@ -1645,10 +1678,12 @@ def main() -> None:
     bluetooth = BluetoothBridge(writable_root)
     bluetooth.start()
     firmware = FirmwareFlasher(project_root(), writable_root)
+    agent_quota = AgentQuotaManager(default_providers(), AgentQuotaConfigStore(writable_root / "agent-quota.json"))
     server = BridgeServer((arguments.host, arguments.port), store, token, runtime, collector_restart,
                           custom, modules, dotii, display, codex_check, assets, bambu_config, bambu,
                           bluetooth, firmware, writable_root, application_root(), arguments.codex_command,
-                          arguments.parent_pid)
+                          arguments.parent_pid, agent_quota=agent_quota)
+    agent_quota.start(stop)
     server.usb.start()
     if arguments.parent_pid > 1:
         threading.Thread(

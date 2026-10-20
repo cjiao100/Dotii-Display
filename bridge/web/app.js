@@ -44,6 +44,7 @@ const state = {
   dotiiConfig: null,
   dotiiConfigDirty: false,
   dotiiConfigSaving: false,
+  agentQuotaSaving: {},
 };
 
 const byId = (id) => document.getElementById(id);
@@ -641,6 +642,170 @@ function formatMinutes(value) {
   return tr`${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
 }
 
+const AGENT_STATUS_TEXT = {
+  ok: "正常", pending: "读取中", disabled: "已关闭", not_configured: "未配置",
+  unavailable: "不可用", auth_error: "需要登录", error: "异常",
+};
+const AGENT_STATUS_BADGE = {
+  ok: "ready", pending: "running", disabled: "idle", not_configured: "idle",
+  unavailable: "idle", auth_error: "error", error: "error",
+};
+const AGENT_REGION_TEXT = { auto: "自动", cn: "国内", global: "国际" };
+
+function agentElement(tag, className = "", text = null) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== null && text !== undefined) element.textContent = text;
+  return element;
+}
+
+function formatAgentPercent(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "--";
+  return `${Math.round(Number(value))}%`;
+}
+
+function agentWindowRow(window) {
+  const row = agentElement("div", "agent-quota-window");
+  const heading = agentElement("div", "agent-quota-window-heading");
+  heading.append(agentElement("span", "", t(window.label || window.id || "")));
+  const used = window.used_percent;
+  heading.append(agentElement("strong", "", used === null || used === undefined
+    ? "--" : tr`剩余 ${formatAgentPercent(window.remaining_percent)}`));
+  const bar = agentElement("div", "agent-quota-bar");
+  const fill = agentElement("span");
+  const percent = Math.max(0, Math.min(100, Number(used) || 0));
+  fill.style.width = `${percent}%`;
+  if (percent >= 90) fill.dataset.level = "high";
+  else if (percent >= 70) fill.dataset.level = "medium";
+  bar.append(fill);
+  const meta = agentElement("small", "agent-quota-window-meta");
+  const parts = [];
+  if (used !== null && used !== undefined) parts.push(tr`已用 ${formatAgentPercent(used)}`);
+  if (window.used !== null && window.used !== undefined && window.limit) {
+    parts.push(`${formatNumber(window.used)} / ${formatNumber(window.limit)}${window.unit ? ` ${t(window.unit)}` : ""}`);
+  }
+  if (window.reset_at_epoch) parts.push(tr`重置 ${formatTime(window.reset_at_epoch)}`);
+  meta.textContent = parts.join(" · ") || "--";
+  row.append(heading, bar, meta);
+  return row;
+}
+
+function agentQuotaCard(provider) {
+  const card = agentElement("article", "dependency-panel agent-quota-card");
+  card.dataset.provider = provider.id;
+  card.dataset.status = provider.status;
+  const heading = agentElement("div", "dependency-heading");
+  const title = agentElement("div");
+  title.append(agentElement("h3", "", provider.name || provider.id));
+  const planText = provider.plan ? tr`${provider.plan} 计划` : "";
+  title.append(agentElement("p", "", planText || (provider.kind === "cli" ? t("通过本机 CLI 读取") : t("通过官方额度接口读取"))));
+  const badge = agentElement("span", "dependency-badge");
+  badge.dataset.state = provider.refreshing && provider.status !== "ok" ? "running" : (AGENT_STATUS_BADGE[provider.status] || "idle");
+  badge.textContent = t(AGENT_STATUS_TEXT[provider.status] || provider.status || "--") + (provider.stale ? ` · ${t("上次数据")}` : "");
+  heading.append(title, badge);
+  card.append(heading);
+
+  const windows = Array.isArray(provider.windows) ? provider.windows : [];
+  if (windows.length) {
+    const list = agentElement("div", "agent-quota-windows");
+    windows.forEach((window) => list.append(agentWindowRow(window)));
+    card.append(list);
+  }
+  const message = provider.error || provider.detail || provider.detection_detail || "";
+  if (message) card.append(agentElement("p", "dependency-status agent-quota-message", t(message)));
+
+  const actions = agentElement("div", "agent-quota-actions");
+  const toggle = agentElement("label", "module-switch");
+  toggle.append(agentElement("span", "", t("启用")));
+  const checkbox = agentElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = Boolean(provider.enabled);
+  checkbox.disabled = Boolean(state.agentQuotaSaving[provider.id]);
+  checkbox.addEventListener("change", () => updateAgentProvider(provider.id, { enabled: checkbox.checked }));
+  const track = agentElement("span", "switch-track");
+  track.setAttribute("aria-hidden", "true");
+  toggle.append(checkbox, track);
+  actions.append(toggle);
+  const regions = Array.isArray(provider.regions) ? provider.regions : [];
+  if (regions.length > 1) {
+    const regionLabel = agentElement("label", "agent-quota-region");
+    regionLabel.append(agentElement("span", "", t("区域")));
+    const select = agentElement("select");
+    regions.forEach((region) => {
+      const option = agentElement("option", "", t(AGENT_REGION_TEXT[region] || region));
+      option.value = region;
+      option.selected = region === provider.region;
+      select.append(option);
+    });
+    select.disabled = Boolean(state.agentQuotaSaving[provider.id]);
+    select.addEventListener("change", () => updateAgentProvider(provider.id, { region: select.value }));
+    regionLabel.append(select);
+    actions.append(regionLabel);
+  }
+  const refresh = agentElement("button", "quiet-button", t("刷新"));
+  refresh.type = "button";
+  refresh.disabled = !provider.enabled || Boolean(provider.refreshing);
+  refresh.addEventListener("click", () => refreshAgentQuota(provider.id));
+  actions.append(refresh);
+  const updated = agentElement("time", "agent-quota-updated", provider.fetched_at_epoch
+    ? tr`更新于 ${formatTime(provider.fetched_at_epoch)}` : t("尚未更新"));
+  actions.append(updated);
+  card.append(actions);
+  return card;
+}
+
+function renderAgentQuota(agentQuota = {}) {
+  const providers = Array.isArray(agentQuota.providers) ? agentQuota.providers : [];
+  const grid = byId("agent-quota-grid");
+  // Do not rebuild while the user is interacting with a control in the grid.
+  if (grid.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+  if (!providers.length) {
+    grid.replaceChildren(agentElement("p", "dependency-status", t("暂无可用的 Agent 额度数据源")));
+  } else {
+    grid.replaceChildren(...providers.map(agentQuotaCard));
+  }
+  const enabled = providers.filter((provider) => provider.enabled);
+  const healthy = enabled.filter((provider) => provider.status === "ok");
+  setText("agents-nav-state", enabled.length ? `${healthy.length}/${enabled.length}` : t("未启用"));
+}
+
+async function postAgentQuota(path, payload) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || t("设置失败"));
+  if (state.overview) state.overview.agent_quota = result.agent_quota;
+  renderAgentQuota(result.agent_quota);
+  return result;
+}
+
+async function updateAgentProvider(providerId, changes) {
+  if (state.agentQuotaSaving[providerId]) return;
+  state.agentQuotaSaving[providerId] = true;
+  try {
+    await postAgentQuota("/api/v1/admin/agent-quota/provider", { id: providerId, ...changes });
+    showToast(t("Agent 额度设置已保存"));
+  } catch (error) {
+    showToast(error.message || t("设置失败"));
+  } finally {
+    state.agentQuotaSaving[providerId] = false;
+    await refreshOverview();
+  }
+}
+
+async function refreshAgentQuota(providerId = null) {
+  try {
+    await postAgentQuota("/api/v1/admin/agent-quota/refresh", providerId ? { id: providerId } : {});
+    showToast(t("正在刷新 Agent 额度"));
+    window.setTimeout(() => refreshOverview(), 2500);
+  } catch (error) {
+    showToast(error.message || t("刷新失败"));
+  }
+}
+
 function renderBambu(bambu = {}, config = {}, enabled = true) {
   if (!state.bambuLoaded) {
     byId("bambu-name").value = config.name || "Bambu Lab";
@@ -1106,6 +1271,7 @@ function renderOverview(overview) {
     renderDotiiConfigEditor();
   }
   renderDotii(snapshot.dotii || {}, dotiiEnabled);
+  renderAgentQuota(overview.agent_quota || {});
   const displayConfig = overview.display_config || snapshot.display || {};
   const codexUi = displayConfig.codex_ui === "dual_limit" ? "dual_limit" : "classic";
   byId("codex-overview").classList.toggle("dual-limit", codexUi === "dual_limit");
@@ -1742,6 +1908,7 @@ document.querySelectorAll(".module-tab").forEach((button) => {
 });
 
 byId("refresh-button").addEventListener("click", () => refreshOverview({ announce: true }));
+byId("agent-quota-refresh").addEventListener("click", () => refreshAgentQuota());
 byId("auto-start").addEventListener("change", (event) => updateAutoStart(event.target.checked));
 byId("display-form").addEventListener("submit", saveDisplaySettings);
 byId("dock-angle").addEventListener("input", (event) => {
