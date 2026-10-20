@@ -101,3 +101,5 @@
 {"已连接", "Connected"},
 {"连接中", "Connecting"},
 {"等待 USB", "Waiting for USB"},
+{"蓝牙", "Bluetooth"},
+{"等待蓝牙", "Waiting for Bluetooth"},

@@ -2379,7 +2379,8 @@ static void ui_timer(lv_timer_t *timer)
         inactive_ms > active_screen_off_timeout * 1000U) {
         if (!enter_screen_saver()) screen_off();
     }
-    if (!connectivity_usb_active() && active_sleep_timeout > 0 && inactive_ms > active_sleep_timeout * 1000U) {
+    /* Deep sleep stops USB and BLE; keep an active sync session alive (screen may still turn off). */
+    if (!connectivity_sync_session_active() && active_sleep_timeout > 0 && inactive_ms > active_sleep_timeout * 1000U) {
         s_last_activity = lv_tick_get();
         board_input_request_sleep();
     }

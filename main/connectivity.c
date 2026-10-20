@@ -6,6 +6,10 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_mac.h"
+#include "esp_random.h"
+#include "ble_bridge.h"
+#include "miniz.h"
+#include "psa/crypto.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "esp_rom_crc.h"
@@ -68,8 +72,8 @@ EXT_RAM_BSS_ATTR static uint8_t s_usb_decoded[4096];
 
 bool connectivity_usb_active(void)
 {
-    return strcmp(s_connection_mode, "wifi") != 0 && s_usb_last_sync > 0 &&
-           esp_timer_get_time() - s_usb_last_sync < 12000000;
+    return (strcmp(s_connection_mode, "auto") == 0 || strcmp(s_connection_mode, "usb") == 0) &&
+           s_usb_last_sync > 0 && esp_timer_get_time() - s_usb_last_sync < 12000000;
 }
 
 static uint8_t *s_custom_image_buffers[2];
@@ -923,6 +927,8 @@ static bool fetch_bambu_camera(uint32_t revision)
 }
 
 static void apply_connection_options(cJSON *root);
+bool connectivity_ble_active(void);
+static bool ble_bambu_command(const char *action);
 
 static bool fetch_snapshot(codex_snapshot_t *snapshot)
 {
@@ -1016,6 +1022,7 @@ static bool send_bambu_command(bambu_command_t command)
         cJSON_Delete(message);
         return true;
     }
+    if (connectivity_ble_active() && ble_bambu_command(action)) return true;
     char url[256];
     strlcpy(url, device_config->bridge_url, sizeof(url));
     char *last_slash = strrchr(url, '/');
@@ -1096,12 +1103,180 @@ static bool token_equal(const char *a, const char *b)
     return difference == 0;
 }
 
+/* ---- Transport-agnostic request handling (USB and BLE share DTU1) ---- */
+
+typedef enum {
+    TRANSPORT_USB = 0,
+    TRANSPORT_BLE,
+} sync_transport_t;
+
+#define SYNC_FRESH_US 12000000LL
+#define BLE_INFLATED_MAX (96 * 1024)
+#define BLE_AUTH_CONTEXT "dotii-ble-auth-v1"
+
+static int64_t s_ble_last_sync;
+static int64_t s_wifi_last_data;
+static uint32_t s_ble_auth_session;
+static uint32_t s_ble_data_session;
+static uint32_t s_ble_nonce_session;
+static char s_ble_nonce[33];
+static uint32_t s_ble_want_session;
+static bool s_ble_want_sent;
+static tinfl_decompressor *s_inflater;
+
+static bool mode_is(const char *mode)
+{
+    return strcmp(s_connection_mode, mode) == 0;
+}
+
+static bool usb_mode_allowed(void)
+{
+    return mode_is("auto") || mode_is("usb");
+}
+
+static bool ble_mode_allowed(void)
+{
+    return mode_is("auto") || mode_is("ble");
+}
+
+static bool wifi_data_fresh(void)
+{
+    return s_wifi_connected && s_wifi_last_data > 0 && esp_timer_get_time() - s_wifi_last_data < SYNC_FRESH_US;
+}
+
+bool connectivity_ble_active(void)
+{
+    const uint32_t session = ble_bridge_session();
+    return ble_mode_allowed() && session != 0 && session == s_ble_data_session && s_ble_last_sync > 0 &&
+           esp_timer_get_time() - s_ble_last_sync < SYNC_FRESH_US;
+}
+
+bool connectivity_sync_session_active(void)
+{
+    return connectivity_usb_active() || connectivity_ble_active();
+}
+
+/* Auto priority: USB > Wi-Fi > BLE. "ble" mode always wants BLE data. */
+static bool ble_wants_data(void)
+{
+    if (mode_is("ble")) return true;
+    if (!mode_is("auto")) return false;
+    if (connectivity_usb_active()) return false;
+    return !wifi_data_fresh();
+}
+
+static void transport_send(sync_transport_t transport, uint32_t session, cJSON *message)
+{
+    if (transport == TRANSPORT_BLE) (void)ble_bridge_send_json(session, message);
+    else usb_transport_send(message);
+}
+
+static int hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* HMAC-SHA256(bound token, "dotii-ble-auth-v1|<device_id>|<nonce>") so the
+   token itself never crosses the Just Works encrypted link. */
+static bool ble_auth_matches(const char *key, const char *nonce, const char *mac_hex)
+{
+    uint8_t mac[32];
+    if (strlen(mac_hex) != sizeof(mac) * 2) return false;
+    for (size_t index = 0; index < sizeof(mac); index++) {
+        int high = hex_value(mac_hex[index * 2]);
+        int low = hex_value(mac_hex[index * 2 + 1]);
+        if (high < 0 || low < 0) return false;
+        mac[index] = (uint8_t)((high << 4) | low);
+    }
+    char message[96];
+    int written = snprintf(message, sizeof(message), "%s|%s|%s", BLE_AUTH_CONTEXT, s_device_id, nonce);
+    if (written <= 0 || (size_t)written >= sizeof(message)) return false;
+    if (psa_crypto_init() != PSA_SUCCESS) return false;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_key_id_t key_id = 0;
+    psa_status_t status = psa_import_key(&attributes, (const uint8_t *)key, strlen(key), &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) return false;
+    status = psa_mac_verify(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256), (const uint8_t *)message,
+                            (size_t)written, mac, sizeof(mac));
+    psa_destroy_key(key_id);
+    return status == PSA_SUCCESS;
+}
+
+static void new_ble_challenge(uint32_t session)
+{
+    uint8_t random[16];
+    esp_fill_random(random, sizeof(random));
+    for (size_t index = 0; index < sizeof(random); index++) {
+        snprintf(s_ble_nonce + index * 2, 3, "%02x", random[index]);
+    }
+    s_ble_nonce_session = session;
+}
+
+/* DTZ1 body: u32 LE inflated length + zlib stream. Inflate with the ROM tinfl
+   into PSRAM; the 11 KB decompressor state is also kept in PSRAM. */
+static cJSON *decode_ble_frame(const ble_frame_t *frame)
+{
+    if (!frame->compressed) return cJSON_ParseWithLength((const char *)frame->body, frame->length);
+    if (frame->length < 5) return NULL;
+    const uint32_t inflated = (uint32_t)frame->body[0] | ((uint32_t)frame->body[1] << 8) |
+                              ((uint32_t)frame->body[2] << 16) | ((uint32_t)frame->body[3] << 24);
+    if (inflated == 0 || inflated > BLE_INFLATED_MAX) return NULL;
+    if (s_inflater == NULL) {
+        s_inflater = heap_caps_malloc(sizeof(*s_inflater), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_inflater == NULL) return NULL;
+    }
+    uint8_t *output = heap_caps_malloc(inflated + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (output == NULL) return NULL;
+    tinfl_init(s_inflater);
+    size_t input_size = frame->length - 4;
+    size_t output_size = inflated;
+    tinfl_status status = tinfl_decompress(s_inflater, frame->body + 4, &input_size, output, output, &output_size,
+                                           TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    cJSON *message = NULL;
+    if (status == TINFL_STATUS_DONE && output_size == inflated) {
+        output[inflated] = '\0';
+        message = cJSON_ParseWithLength((const char *)output, inflated);
+    } else {
+        ESP_LOGW(TAG, "BLE frame inflate failed: status=%d out=%u/%lu", (int)status, (unsigned)output_size,
+                 (unsigned long)inflated);
+    }
+    heap_caps_free(output);
+    return message;
+}
+
+static void notify_ble_want_data(void)
+{
+    const uint32_t session = ble_bridge_session();
+    if (session == 0 || session != s_ble_auth_session) return;
+    const bool want = ble_wants_data();
+    if (session == s_ble_want_session && want == s_ble_want_sent) return;
+    cJSON *event = cJSON_CreateObject();
+    if (event == NULL) return;
+    cJSON_AddStringToObject(event, "event", "want_data");
+    cJSON_AddBoolToObject(event, "want_data", want);
+    cJSON_AddStringToObject(event, "mode", s_connection_mode);
+    if (ble_bridge_send_json(session, event)) {
+        s_ble_want_session = session;
+        s_ble_want_sent = want;
+    }
+    cJSON_Delete(event);
+}
+
+
 static void apply_connection_options(cJSON *root)
 {
     const char *language = usb_string(root, "language");
     ui_language_set(language);
     const char *mode = usb_string(root, "connection_mode");
-    if ((strcmp(mode, "auto") == 0 || strcmp(mode, "usb") == 0 || strcmp(mode, "wifi") == 0) &&
+    if ((strcmp(mode, "auto") == 0 || strcmp(mode, "usb") == 0 || strcmp(mode, "wifi") == 0 ||
+         strcmp(mode, "ble") == 0) &&
         strcmp(mode, s_connection_mode) != 0) {
         strlcpy(s_connection_mode, mode, sizeof(s_connection_mode));
         nvs_handle_t handle;
@@ -1160,36 +1335,106 @@ static bool receive_usb_image(cJSON *root)
     return true;
 }
 
-static void process_usb(cJSON *request)
+static bool ble_bambu_command(const char *action)
+{
+    const uint32_t session = ble_bridge_session();
+    if (session == 0 || session != s_ble_auth_session) return false;
+    cJSON *message = cJSON_CreateObject();
+    if (message == NULL) return false;
+    cJSON_AddStringToObject(message, "event", "bambu_command");
+    cJSON_AddStringToObject(message, "action", action);
+    const bool sent = ble_bridge_send_json(session, message);
+    cJSON_Delete(message);
+    return sent;
+}
+
+static void publish_transport_snapshot(sync_transport_t transport, uint32_t session)
+{
+    const int64_t now = esp_timer_get_time();
+    if (transport == TRANSPORT_BLE) {
+        /* Phase 1 carries text only; images stay on USB and Wi-Fi. */
+        s_work_snapshot.custom_image_available = false;
+        s_work_snapshot.bambu_camera_available = false;
+        s_ble_last_sync = now;
+        s_ble_data_session = session;
+        strlcpy(s_bridge_note, "管理中心在线", sizeof(s_bridge_note));
+    } else {
+        s_usb_last_sync = now;
+        if (!connectivity_custom_image_data(s_work_snapshot.custom_image_revision)) s_work_snapshot.custom_image_available = false;
+        if (!connectivity_bambu_camera_data(s_work_snapshot.bambu_camera_revision)) s_work_snapshot.bambu_camera_available = false;
+    }
+    s_bridge_online = true;
+    s_bridge_failures = 0;
+    app_state_tasks_publish(s_work_tasks, s_work_task_count);
+    s_last_snapshot = s_work_snapshot;
+    s_have_snapshot = true;
+    app_state_publish(&s_work_snapshot);
+}
+
+static void apply_epoch(cJSON *request)
+{
+    cJSON *epoch = cJSON_GetObjectItemCaseSensitive(request, "epoch");
+    if (cJSON_IsNumber(epoch) && epoch->valuedouble > 1700000000) {
+        struct timeval now = {.tv_sec = (time_t)epoch->valuedouble};
+        settimeofday(&now, NULL);
+    }
+}
+
+/* Formerly process_usb(): the same DTU1 request set on every transport. The
+   reply always goes back on the transport (and BLE session) it came from. */
+static void process_request(cJSON *request, sync_transport_t transport, uint32_t session)
 {
     cJSON *response = cJSON_CreateObject();
+    if (response == NULL) return;
     cJSON *id = cJSON_GetObjectItemCaseSensitive(request, "id");
     cJSON_AddNumberToObject(response, "id", cJSON_IsNumber(id) ? id->valuedouble : 0);
     const char *op = usb_string(request, "op");
     const char *token = usb_string(request, "token");
     const device_config_values_t *config = device_config_get();
     const char *bound = config->provisioned ? config->bridge_token : s_usb_token;
+    const bool ble = transport == TRANSPORT_BLE;
     const char *error = NULL;
     bool restart = false;
-    if (strlen(token) < 16 || strlen(token) > 64 || (*bound && !token_equal(token, bound))) {
-        error = "binding_mismatch";
+    if (!ble) {
+        if (strlen(token) < 16 || strlen(token) > 64 || (*bound && !token_equal(token, bound))) {
+            error = "binding_mismatch";
+        }
+    } else if (strcmp(op, "hello") != 0 && strcmp(op, "auth") != 0 && strcmp(op, "ble_diag") != 0 &&
+               (session == 0 || session != s_ble_auth_session)) {
+        error = "unauthenticated";
+    }
+    if (error) {
     } else if (strcmp(op, "hello") == 0) {
         cJSON_AddStringToObject(response, "product", "Dotii");
         cJSON_AddNumberToObject(response, "protocol", 1);
         cJSON_AddStringToObject(response, "device_id", s_device_id);
         cJSON_AddStringToObject(response, "firmware", esp_app_get_description()->version);
+        if (ble) {
+            new_ble_challenge(session);
+            cJSON_AddStringToObject(response, "challenge", s_ble_nonce);
+            cJSON_AddStringToObject(response, "auth", "hmac-sha256");
+            cJSON_AddBoolToObject(response, "bound", *bound != '\0');
+        }
+    } else if (strcmp(op, "auth") == 0) {
+        const char *mac = usb_string(request, "mac");
+        if (!ble) error = "unsupported_transport";
+        else if (!*bound) error = "not_bound";
+        else if (session == 0 || s_ble_nonce_session != session || !s_ble_nonce[0]) error = "no_challenge";
+        else if (!ble_auth_matches(bound, s_ble_nonce, mac)) error = "binding_mismatch";
+        else s_ble_auth_session = session;
+        /* One attempt per challenge. */
+        s_ble_nonce[0] = '\0';
+        s_ble_nonce_session = 0;
+    } else if (strcmp(op, "ble_diag") == 0) {
+        ble_bridge_fill_diag(response);
     } else if (strcmp(op, "snapshot") == 0) {
         cJSON *payload = cJSON_GetObjectItemCaseSensitive(request, "snapshot");
         bool parsed = cJSON_IsObject(payload) && parse_snapshot_object(payload, &s_work_snapshot);
         if (!parsed) error = "invalid_snapshot";
         else {
             apply_connection_options(request);
-            cJSON *epoch = cJSON_GetObjectItemCaseSensitive(request, "epoch");
-            if (cJSON_IsNumber(epoch) && epoch->valuedouble > 1700000000) {
-                struct timeval now = {.tv_sec = (time_t)epoch->valuedouble};
-                settimeofday(&now, NULL);
-            }
-            if (!*bound) {
+            apply_epoch(request);
+            if (!ble && !*bound) {
                 nvs_handle_t handle;
                 if (nvs_open("dotii_cfg", NVS_READWRITE, &handle) == ESP_OK) {
                     if (nvs_set_str(handle, "usb_token", token) == ESP_OK && nvs_commit(handle) == ESP_OK)
@@ -1197,25 +1442,23 @@ static void process_usb(cJSON *request)
                     nvs_close(handle);
                 }
             }
-            if (strcmp(s_connection_mode, "wifi") != 0) {
-                s_usb_last_sync = esp_timer_get_time();
-                s_bridge_online = true;
-                s_bridge_failures = 0;
-                if (!connectivity_custom_image_data(s_work_snapshot.custom_image_revision)) s_work_snapshot.custom_image_available = false;
-                if (!connectivity_bambu_camera_data(s_work_snapshot.bambu_camera_revision)) s_work_snapshot.bambu_camera_available = false;
-                app_state_tasks_publish(s_work_tasks, s_work_task_count);
-                s_last_snapshot = s_work_snapshot;
-                s_have_snapshot = true;
-                app_state_publish(&s_work_snapshot);
-            }
+            if (ble ? ble_wants_data() : usb_mode_allowed()) publish_transport_snapshot(transport, session);
         }
+    } else if (strcmp(op, "heartbeat") == 0) {
+        apply_epoch(request);
+        /* Keeps BLE fresh between send-on-change snapshots, but only once this
+           session has delivered data and BLE is still the wanted source. */
+        if (ble && session == s_ble_data_session && ble_wants_data()) s_ble_last_sync = esp_timer_get_time();
     } else if (strcmp(op, "image") == 0) {
-        if (!receive_usb_image(request)) error = "invalid_image_chunk";
+        if (ble) error = "unsupported_transport";
+        else if (!receive_usb_image(request)) error = "invalid_image_chunk";
     } else if (strcmp(op, "provision") == 0) {
         device_config_values_t next = *config;
         const char *ssid = usb_string(request, "ssid"), *password = usb_string(request, "password");
         const char *url = usb_string(request, "bridge_url");
-        if (!*ssid || strlen(ssid) > 32 || strlen(password) > 64 || strlen(url) >= sizeof(next.bridge_url) || strncmp(url, "http://", 7)) {
+        if (ble) {
+            error = "unsupported_transport";
+        } else if (!*ssid || strlen(ssid) > 32 || strlen(password) > 64 || strlen(url) >= sizeof(next.bridge_url) || strncmp(url, "http://", 7)) {
             error = "invalid_config";
         } else {
             strlcpy(next.wifi_ssid, ssid, sizeof(next.wifi_ssid));
@@ -1232,6 +1475,10 @@ static void process_usb(cJSON *request)
     } else error = "unknown_operation";
     cJSON_AddBoolToObject(response, "ok", error == NULL);
     if (error) cJSON_AddStringToObject(response, "error", error);
+    cJSON_AddStringToObject(response, "transport", ble ? "ble" : "usb");
+    cJSON_AddBoolToObject(response, "want_data", ble ? ble_wants_data() : usb_mode_allowed());
+    cJSON_AddBoolToObject(response, "usb_active", connectivity_usb_active());
+    cJSON_AddBoolToObject(response, "ble_active", connectivity_ble_active());
     cJSON_AddBoolToObject(response, "wifi", s_wifi_connected);
     cJSON_AddBoolToObject(response, "wifi_bridge", s_wifi_bridge_online);
     cJSON_AddStringToObject(response, "ssid", config->wifi_ssid);
@@ -1242,7 +1489,7 @@ static void process_usb(cJSON *request)
     cJSON_AddNumberToObject(response, "free_internal", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(response, "custom_revision", s_custom_image_active >= 0 ? s_custom_image_revisions[s_custom_image_active] : 0);
     cJSON_AddNumberToObject(response, "camera_revision", s_bambu_camera_active >= 0 ? s_bambu_camera_revisions[s_bambu_camera_active] : 0);
-    usb_transport_send(response);
+    transport_send(transport, session, response);
     cJSON_Delete(response);
     if (restart) { vTaskDelay(pdMS_TO_TICKS(300)); esp_restart(); }
 }
@@ -1261,9 +1508,29 @@ static void bridge_task(void *argument)
 
         cJSON *message;
         while ((message = usb_transport_receive()) != NULL) {
-            process_usb(message);
+            process_request(message, TRANSPORT_USB, 0);
             cJSON_Delete(message);
         }
+        ble_frame_t frame;
+        while (ble_bridge_receive(&frame)) {
+            const uint32_t session = frame.session;
+            message = decode_ble_frame(&frame);
+            ble_bridge_frame_free(&frame);
+            if (message != NULL) {
+                process_request(message, TRANSPORT_BLE, session);
+                cJSON_Delete(message);
+            } else {
+                cJSON *reply = cJSON_CreateObject();
+                if (reply != NULL) {
+                    cJSON_AddNumberToObject(reply, "id", 0);
+                    cJSON_AddBoolToObject(reply, "ok", false);
+                    cJSON_AddStringToObject(reply, "error", "invalid_frame");
+                    transport_send(TRANSPORT_BLE, session, reply);
+                    cJSON_Delete(reply);
+                }
+            }
+        }
+        notify_ble_want_data();
         bambu_command_t usb_command;
         if (connectivity_usb_active()) {
             while (xQueueReceive(s_bambu_command_queue, &usb_command, 0) == pdTRUE) send_bambu_command(usb_command);
@@ -1277,14 +1544,32 @@ static void bridge_task(void *argument)
             if (s_bridge_online) { s_bridge_online = false; publish_offline_state(); }
             continue;
         }
+        const bool ble_active = connectivity_ble_active();
+        if (strcmp(s_connection_mode, "ble") == 0) {
+            if (ble_active) {
+                bambu_command_t command;
+                while (xQueueReceive(s_bambu_command_queue, &command, 0) == pdTRUE) send_bambu_command(command);
+            } else if (s_bridge_online) {
+                s_bridge_online = false;
+                publish_offline_state();
+            }
+            continue;
+        }
         if (!(bits & REFRESH_REQUESTED_BIT) && esp_timer_get_time() - s_last_wifi_poll < CONFIG_STATE_DISPLAY_POLL_SECONDS * 1000000LL) continue;
         s_last_wifi_poll = esp_timer_get_time();
         if (s_wifi_connected) {
+            if (ble_active) {
+                /* Probe with the short ping first so an unreachable bridge cannot
+                   stall BLE request handling for the 10 s snapshot timeout. */
+                check_wifi_link();
+                if (!s_wifi_bridge_online) continue;
+            }
             bambu_command_t command;
             while (s_bambu_command_queue != NULL && xQueueReceive(s_bambu_command_queue, &command, 0) == pdTRUE) {
                 send_bambu_command(command);
             }
             if (fetch_snapshot(&s_work_snapshot)) {
+                s_wifi_last_data = esp_timer_get_time();
                 if (!s_bridge_online) ESP_LOGI(TAG, "Bridge snapshot received");
                 s_last_snapshot = s_work_snapshot;
                 s_have_snapshot = true;
@@ -1293,6 +1578,9 @@ static void bridge_task(void *argument)
                 s_bridge_failures = 0;
                 strlcpy(s_bridge_note, s_work_snapshot.preview_data ? "管理中心在线 · 预览数据" : "管理中心在线", sizeof(s_bridge_note));
                 app_state_publish(&s_work_snapshot);
+            } else if (ble_active) {
+                /* Wi-Fi is preferred but unreachable: keep the BLE data on screen. */
+                s_wifi_bridge_online = false;
             } else {
                 s_wifi_bridge_online = false;
                 if (s_bridge_failures < UINT8_MAX) s_bridge_failures++;
@@ -1306,9 +1594,11 @@ static void bridge_task(void *argument)
                 }
             }
         } else {
-            s_bridge_online = false;
             s_wifi_bridge_online = false;
-            publish_offline_state();
+            if (!ble_active) {
+                s_bridge_online = false;
+                publish_offline_state();
+            }
         }
     }
 }
@@ -1450,6 +1740,8 @@ void connectivity_get_ip(char *buffer, size_t buffer_size)
 void connectivity_get_bridge_summary(char *buffer, size_t buffer_size)
 {
     if (connectivity_usb_active()) snprintf(buffer, buffer_size, "USB · %s", ui_tr("已连接"));
+    else if (connectivity_ble_active()) snprintf(buffer, buffer_size, "%s · %s", ui_tr("蓝牙"), ui_tr("已连接"));
     else if (!strcmp(s_connection_mode, "usb")) snprintf(buffer, buffer_size, "%s", ui_tr("等待 USB"));
+    else if (!strcmp(s_connection_mode, "ble")) snprintf(buffer, buffer_size, "%s", ui_tr("等待蓝牙"));
     else strlcpy(buffer, ui_tr(s_bridge_note), buffer_size);
 }

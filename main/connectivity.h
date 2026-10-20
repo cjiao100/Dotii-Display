@@ -8,6 +8,10 @@
 void connectivity_start(void);
 esp_err_t connectivity_start_usb(void);
 bool connectivity_usb_active(void);
+/* BLE is the current data source (fresh authenticated BLE sync). */
+bool connectivity_ble_active(void);
+/* A cable or BLE sync session that deep sleep would break. */
+bool connectivity_sync_session_active(void);
 void connectivity_request_refresh(void);
 bool connectivity_is_wifi_connected(void);
 void connectivity_get_summary(char *buffer, size_t buffer_size);
