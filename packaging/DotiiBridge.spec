@@ -42,6 +42,7 @@ for relative_name in firmware_files.values():
 hiddenimports = [
     *collect_submodules("bleak"),
     *collect_submodules("esptool"),
+    *collect_submodules("cryptography"),
 ]
 
 a = Analysis(

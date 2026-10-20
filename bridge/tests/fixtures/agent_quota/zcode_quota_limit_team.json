@@ -1,0 +1,11 @@
+{
+  "code": 200,
+  "success": true,
+  "data": {
+    "level": "max",
+    "limits": [
+      {"type": "CREDIT_LIMIT", "unit": 3, "number": 5, "percentage": 81.5},
+      {"type": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 4000, "remaining": 3900, "percentage": 2.5}
+    ]
+  }
+}

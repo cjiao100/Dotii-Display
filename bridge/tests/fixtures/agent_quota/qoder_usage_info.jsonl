@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"synthetic"}
+{"type":"control_response","response":{"subtype":"success","request_id":"REQUEST_ID","response":{"usage":{"userType":"pro","usageType":"credits","isQuotaExceeded":false,"totalUsagePercentage":35,"userQuota":{"total":2000,"used":700,"remaining":1300,"percentage":35,"unit":"credits"},"addOnQuota":{"total":1500,"used":0,"remaining":1500,"unit":"credits"}}}}}

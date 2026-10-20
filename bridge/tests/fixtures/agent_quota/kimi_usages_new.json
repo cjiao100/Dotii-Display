@@ -1,0 +1,13 @@
+{
+  "usages": {
+    "limit_5h": {"used_ratio": 0.42, "reset_time": "2026-10-20T08:00:00Z"},
+    "limit_month_total": {"used_ratio": 0.18, "reset_time": "2026-11-01T00:00:00.123456789Z"},
+    "limit_month_code": {"used_ratio": 0.3, "reset_time": "2026-11-01T00:00:00Z"}
+  },
+  "boosterWallet": {
+    "balance": {"type": "BOOSTER", "amount": 5000000000, "amountLeft": 2500000000},
+    "monthlyChargeLimit": {"priceInCents": 10000, "currency": "CNY"},
+    "monthlyUsed": 0,
+    "monthlyChargeLimitEnabled": false
+  }
+}
