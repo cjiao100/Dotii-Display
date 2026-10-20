@@ -100,13 +100,13 @@ class ZCodeParserTests(unittest.TestCase):
             with self.assertRaises(QuotaError) as caught:
                 provider.fetch()
             self.assertEqual(caught.exception.status, "not_configured")
-            # An installed ZCode keeps its keys encrypted: detected, never decrypted.
+            # An installed ZCode whose key cannot be decrypted: detected, not configured.
             (Path(folder) / ".zcode" / "v2").mkdir(parents=True)
             (Path(folder) / ".zcode" / "v2" / "credentials.json").write_text(
-                json.dumps({"provider:builtin:zai": "enc:v1:AAAA.BBBB.CCCC"}), encoding="utf-8")
+                json.dumps({"account-provider:coding-plan:account:zai-x:account:a:api-key":
+                            "enc:v1:AAAA.BBBB.CCCC"}), encoding="utf-8")
             detection = provider.detect()
             self.assertEqual((detection.available, detection.configured), (True, False))
-            self.assertIn("加密", detection.detail)
 
     def test_no_manual_credential_sources_remain(self):
         import agent_quota.zcode as zcode_module
@@ -201,6 +201,119 @@ class CredentialHygieneTests(unittest.TestCase):
                 server.server_close()
         self.assertEqual([hit[0] for hit in hits], ["origin"] * 4)  # same, ok, port, host
         self.assertFalse(any(name == "other" for name, _path, _auth in hits))
+
+
+def _encrypt_zcode_value(plaintext, secret):
+    import base64, hashlib, os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = hashlib.sha256(secret.encode("utf-8")).digest()
+    iv = os.urandom(12)
+    sealed = AESGCM(key).encrypt(iv, plaintext.encode("utf-8"), None)
+    ciphertext, tag = sealed[:-16], sealed[-16:]
+    b = lambda raw: base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return "enc:v1:" + b(iv) + "." + b(tag) + "." + b(ciphertext)
+
+
+class ZCodeCredentialCipherTests(unittest.TestCase):
+    def setUp(self):
+        from agent_quota import zcode
+        if zcode.AESGCM is None:
+            self.skipTest("cryptography not installed")
+
+    def _store(self, folder, entries):
+        from agent_quota.zcode import credential_secret
+        d = Path(folder) / ".zcode" / "v2"
+        d.mkdir(parents=True, exist_ok=True)
+        secret = credential_secret()
+        payload = {k: (_encrypt_zcode_value(v, secret) if enc else v) for k, v, enc in entries}
+        (d / "credentials.json").write_text(json.dumps(payload), encoding="utf-8")
+        return d / "credentials.json"
+
+    def test_roundtrip_decrypt(self):
+        from agent_quota import zcode
+        with temporary_directory() as folder, \
+                mock.patch.dict("os.environ", {"ZCODE_CREDENTIAL_SECRET": "unit-secret"}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            value = _encrypt_zcode_value("abc.def", "unit-secret")
+            self.assertEqual(zcode.decrypt_credential_value(value), "abc.def")
+
+    def test_wrong_tag_and_malformed_return_none(self):
+        from agent_quota import zcode
+        with mock.patch.dict("os.environ", {"ZCODE_CREDENTIAL_SECRET": "unit-secret"}, clear=True):
+            good = _encrypt_zcode_value("abc.def", "unit-secret")
+            head, _tag, ciphertext = good[len("enc:v1:"):].split(".")
+            import base64
+            bad_tag = base64.urlsafe_b64encode(b"\x00" * 16).decode().rstrip("=")
+            self.assertIsNone(zcode.decrypt_credential_value("enc:v1:" + head + "." + bad_tag + "." + ciphertext))
+            self.assertIsNone(zcode.decrypt_credential_value("enc:v1:onlyonepart"))
+            self.assertIsNone(zcode.decrypt_credential_value("enc:v1:aa.bb"))  # cipher missing
+            self.assertIsNone(zcode.decrypt_credential_value("plain-not-encrypted"))
+            self.assertIsNone(zcode.decrypt_credential_value("enc:v1:!!!.@@@.$$$"))  # bad base64url
+            wrong_key = _encrypt_zcode_value("abc.def", "different-secret")
+            self.assertIsNone(zcode.decrypt_credential_value(wrong_key))
+
+    def test_fetch_uses_decrypted_store_key_and_never_leaks_it(self):
+        with temporary_directory() as folder, \
+                mock.patch.dict("os.environ", {"ZCODE_CREDENTIAL_SECRET": "unit-secret"}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            path = self._store(folder, [
+                ("account-provider:coding-plan:account:zai-individual-coding-plan:account:u1:api-key",
+                 "zaiid.zaisecret", True),
+                ("zcodejwttoken", "should-be-ignored-jwt", True),
+            ])
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            provider = ZCodeProvider()
+            detection = provider.detect()
+            self.assertTrue(detection.configured)
+            self.assertNotIn("zaisecret", detection.detail)
+            with mock.patch("agent_quota.zcode.http_get_json",
+                            return_value=fixture("zcode_quota_limit.json")) as get:
+                entry = provider.fetch_quota()
+            url, headers = get.call_args.args[0], get.call_args.args[1]
+            self.assertEqual(url, "https://api.z.ai/api/monitor/usage/quota/limit")  # zai -> global
+            self.assertEqual(headers, {"authorization": "zaiid.zaisecret"})  # raw key, no Bearer
+            self.assertNotIn("zaisecret", json.dumps(entry))
+            self.assertEqual(entry["extra"]["region"], "global")
+            # The source file is only read.
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_region_selection_prefers_bigmodel_when_pinned_cn(self):
+        with temporary_directory() as folder, \
+                mock.patch.dict("os.environ", {"ZCODE_CREDENTIAL_SECRET": "unit-secret"}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            self._store(folder, [
+                ("account-provider:coding-plan:account:zai-individual-coding-plan:account:u:api-key",
+                 "zaiid.zaisecret", True),
+                ("account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:u:api-key",
+                 "bmid.bmsecret", True),
+            ])
+            with mock.patch("agent_quota.zcode.http_get_json",
+                            return_value=fixture("zcode_quota_limit.json")) as get:
+                ZCodeProvider({"region": "cn"}).fetch_quota()
+            self.assertEqual(get.call_args.args[0], "https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+            self.assertEqual(get.call_args.args[1], {"authorization": "bmid.bmsecret"})
+
+    def test_missing_store_file_is_not_detected(self):
+        with temporary_directory() as folder, mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            self.assertFalse(ZCodeProvider().detect().configured)
+            self.assertEqual(ZCodeProvider().detect().detail, "未检测到 ZCode")
+
+    def test_missing_cryptography_is_reported_not_crashed(self):
+        from agent_quota import zcode
+        with temporary_directory() as folder, \
+                mock.patch.dict("os.environ", {"ZCODE_CREDENTIAL_SECRET": "unit-secret"}, clear=True), \
+                mock.patch("pathlib.Path.home", return_value=Path(folder)):
+            (Path(folder) / ".zcode" / "v2").mkdir(parents=True)
+            (Path(folder) / ".zcode" / "v2" / "credentials.json").write_text(
+                json.dumps({"account-provider:coding-plan:account:zai-x:account:a:api-key": "enc:v1:aa.bb.cc"}),
+                encoding="utf-8")
+            with mock.patch("agent_quota.zcode.AESGCM", None):
+                detection = ZCodeProvider().detect()
+                self.assertEqual((detection.available, detection.configured), (True, False))
+                self.assertIn("cryptography", detection.detail)
+                with self.assertRaises(QuotaError):
+                    zcode.decrypt_credential_value("enc:v1:aa.bb.cc")
 
 
 class KimiParserTests(unittest.TestCase):
