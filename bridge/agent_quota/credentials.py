@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
@@ -99,6 +101,35 @@ def find_executable(names: Iterable[str], extra: Iterable[Path] = (), env_name: 
     return None
 
 
+_DOTII_KEY_ENV = re.compile(r"^DOTII_.*_API_KEY$")
+
+
+def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for third-party CLIs: drop Dotii's own API keys (DOTII_*_API_KEY)."""
+    source = os.environ if base is None else base
+    return {key: value for key, value in source.items() if not _DOTII_KEY_ENV.match(key)}
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow only same-host redirects that keep (or upgrade to) https.
+
+    urllib copies request headers, including Authorization, onto the redirected
+    request, so a cross-host or https->http redirect could leak the credential.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 - urllib signature
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if (new.hostname or "").lower() != (old.hostname or "").lower() or (old.port != new.port):
+            raise QuotaError("额度接口重定向到其他主机，已拒绝（避免泄露凭据）", STATUS_ERROR)
+        if old.scheme == "https" and new.scheme != "https":
+            raise QuotaError("额度接口重定向到非 HTTPS 地址，已拒绝", STATUS_ERROR)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+
+
 def http_get_json(url: str, headers: dict[str, str], timeout: float,
                   secrets: Iterable[str | None] = ()) -> Any:
     """GET a JSON document. Error messages never include request headers."""
@@ -109,7 +140,7 @@ def http_get_json(url: str, headers: dict[str, str], timeout: float,
         **headers,
     })
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https hosts
+        with _OPENER.open(request, timeout=timeout) as response:  # noqa: S310 - fixed https hosts
             body = response.read(1024 * 1024)
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):

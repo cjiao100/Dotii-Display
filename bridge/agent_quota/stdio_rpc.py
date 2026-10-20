@@ -152,20 +152,55 @@ def terminate_process_tree(process: subprocess.Popen[Any], grace: float = 3.0) -
                 pass
 
 
-def _terminate(process: subprocess.Popen[Any], grace: float) -> None:
-    if process.poll() is not None:
-        return
+def _group_alive(pgid: int) -> bool:
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-        process.wait(timeout=grace)
-    except (OSError, subprocess.TimeoutExpired):
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _killpg(pgid: int, sig: int) -> bool:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False  # pgid reused by someone else's process group: never touch it
+    return True
+
+
+def _terminate(process: subprocess.Popen[Any], grace: float) -> None:
+    if os.name != "posix":
+        if process.poll() is not None:
+            return
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
+            process.terminate()
+            process.wait(timeout=grace)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
                 process.kill()
-        except OSError:
-            pass
+            except OSError:
+                pass
+        return
+    # The child was started with start_new_session=True, so its pid is the
+    # process-group id. Signal the group even if the leader already exited:
+    # helpers it spawned (MCP servers etc.) stay in that group. While the leader
+    # is unreaped (zombie) the pgid cannot be reused, so poll() only after.
+    pgid = process.pid
+    if not _killpg(pgid, signal.SIGTERM):
+        process.poll()
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        leader_done = process.poll() is not None
+        if leader_done and not _group_alive(pgid):
+            return
+        time.sleep(0.05)
+    _killpg(pgid, signal.SIGKILL)
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass

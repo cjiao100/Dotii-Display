@@ -20,7 +20,7 @@ from .base import (
     Detection, QuotaError, QuotaProvider, QuotaResult, QuotaWindow,
     as_number, clamp_percent, parse_epoch, safe_text,
 )
-from .credentials import find_executable
+from .credentials import child_env, find_executable
 from .stdio_rpc import RpcError, StdioJsonRpc
 
 
@@ -115,7 +115,7 @@ class GrokProvider(QuotaProvider):
         if not path:
             raise QuotaError("未找到 grok CLI", STATUS_UNAVAILABLE)
         deadline = time.monotonic() + self.timeout
-        with StdioJsonRpc([path, "agent", "stdio"], cwd=Path.home()) as client:
+        with StdioJsonRpc([path, "agent", "stdio"], cwd=Path.home(), env=child_env()) as client:
             try:
                 client.request("initialize", {
                     "protocolVersion": 1,

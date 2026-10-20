@@ -29,11 +29,16 @@ UNIT_LABELS = {3: "小时", 5: "月", 6: "周"}
 TOKEN_TYPES = {"TOKENS_LIMIT", "CREDIT_LIMIT"}
 
 
+def _host_matches(host: str, domain: str) -> bool:
+    """Exact host or a real subdomain; ``evilz.ai`` must not match ``z.ai``."""
+    return host == domain or host.endswith("." + domain)
+
+
 def _region_from_base_url(value: str) -> str:
     host = (urlparse(value).hostname or "").lower()
-    if host.endswith("z.ai"):
+    if _host_matches(host, "z.ai"):
         return "global"
-    if host.endswith("bigmodel.cn"):
+    if _host_matches(host, "bigmodel.cn"):
         return "cn"
     return ""
 

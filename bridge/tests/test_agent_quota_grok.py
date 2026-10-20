@@ -100,5 +100,43 @@ class GrokAcpTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, "unavailable")
 
 
+class ProcessTreeTests(unittest.TestCase):
+    @unittest.skipIf(os.name != "posix", "process groups are posix-only")
+    def test_helpers_are_killed_even_after_parent_exited(self):
+        import subprocess
+        from agent_quota.stdio_rpc import terminate_process_tree
+        from test_agent_quota_p2 import assert_process_gone
+        script = ("import subprocess, sys; "
+                  "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                  "stdout=subprocess.DEVNULL); print(p.pid, flush=True)")
+        process = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        helper_pid = int(process.stdout.readline())
+        process.wait(5)  # the parent is gone (and reaped) before cleanup runs
+        terminate_process_tree(process, grace=1.0)
+        assert_process_gone(self, helper_pid)
+
+    @unittest.skipIf(os.name != "posix", "fake CLI uses a shebang script")
+    def test_grok_child_does_not_inherit_dotii_keys(self):
+        from agent_quota.grok import GrokProvider as Provider
+        captured = {}
+        real = __import__("agent_quota.stdio_rpc", fromlist=["StdioJsonRpc"]).StdioJsonRpc
+
+        class Spy(real):
+            def __init__(self, command, cwd=None, env=None):
+                captured["env"] = env
+                super().__init__(command, cwd=cwd, env=env)
+
+            def start(self):
+                raise QuotaError("stop here", "unavailable")
+
+        with mock.patch.dict("os.environ", {"DOTII_KIMI_API_KEY": "dummy", "DOTII_GROK_COMMAND": sys.executable}), \
+                mock.patch("agent_quota.grok.StdioJsonRpc", Spy):
+            with self.assertRaises(QuotaError):
+                Provider().fetch()
+        self.assertIsNotNone(captured["env"])
+        self.assertNotIn("DOTII_KIMI_API_KEY", captured["env"])
+
+
 if __name__ == "__main__":
     unittest.main()

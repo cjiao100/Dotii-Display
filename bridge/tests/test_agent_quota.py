@@ -110,6 +110,80 @@ class ZCodeParserTests(unittest.TestCase):
                 self.assertEqual(provider.resolved_region(), "cn")
 
 
+    def test_base_url_host_matching_is_exact_or_subdomain(self):
+        from agent_quota.zcode import _region_from_base_url
+        self.assertEqual(_region_from_base_url("https://api.z.ai/api/anthropic"), "global")
+        self.assertEqual(_region_from_base_url("https://z.ai"), "global")
+        self.assertEqual(_region_from_base_url("https://open.bigmodel.cn/x"), "cn")
+        for lookalike in ("https://evilz.ai", "https://z.ai.example.com", "https://notbigmodel.cn"):
+            self.assertEqual(_region_from_base_url(lookalike), "", lookalike)
+        provider = ZCodeProvider()
+        with mock.patch("agent_quota.zcode.keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "https://evilz.ai/api",
+                                                "ANTHROPIC_AUTH_TOKEN": "fake-token-1"}, clear=True):
+                self.assertFalse(provider.detect().configured)
+
+
+class CredentialHygieneTests(unittest.TestCase):
+    def test_child_env_drops_dotii_api_keys(self):
+        env = credentials.child_env({"PATH": "/bin", "HOME": "/h", "DOTII_ZCODE_API_KEY": "x",
+                                     "DOTII_KIMI_API_KEY": "y", "DOTII_AGY_COMMAND": "/bin/agy"})
+        self.assertEqual(env, {"PATH": "/bin", "HOME": "/h", "DOTII_AGY_COMMAND": "/bin/agy"})
+
+    def test_https_to_http_redirect_is_rejected(self):
+        import urllib.request
+        handler = credentials._SafeRedirectHandler()
+        request = urllib.request.Request("https://api.example.com/a", headers={"Authorization": "x"})
+        with self.assertRaises(QuotaError):
+            handler.redirect_request(request, None, 302, "Found", {}, "http://api.example.com/b")
+        follow = handler.redirect_request(request, None, 302, "Found", {}, "https://api.example.com/b")
+        self.assertEqual(follow.full_url, "https://api.example.com/b")
+
+    def test_cross_host_redirect_never_reaches_other_host(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        hits = []
+
+        def make_handler(name):
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):  # noqa: N802
+                    hits.append((name, self.path, self.headers.get("Authorization")))
+                    target = {"/same": "/ok", "/port": f"http://127.0.0.1:{other.server_port}/ok",
+                              "/host": f"http://localhost:{origin.server_port}/ok"}.get(self.path)
+                    if target:
+                        self.send_response(302)
+                        self.send_header("Location", target)
+                        self.end_headers()
+                        return
+                    body = b'{"ok": true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args):
+                    pass
+            return Handler
+
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), make_handler("origin"))
+        other = ThreadingHTTPServer(("127.0.0.1", 0), make_handler("other"))
+        for server in (origin, other):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base_url = f"http://127.0.0.1:{origin.server_port}"
+            self.assertEqual(credentials.http_get_json(base_url + "/same", {"Authorization": "t"}, 5), {"ok": True})
+            for path in ("/port", "/host"):
+                with self.assertRaises(QuotaError) as caught:
+                    credentials.http_get_json(base_url + path, {"Authorization": "t"}, 5)
+                self.assertIn("重定向", str(caught.exception))
+        finally:
+            for server in (origin, other):
+                server.shutdown()
+                server.server_close()
+        self.assertEqual([hit[0] for hit in hits], ["origin"] * 4)  # same, ok, port, host
+        self.assertFalse(any(name == "other" for name, _path, _auth in hits))
+
+
 class KimiParserTests(unittest.TestCase):
     def test_new_schema(self):
         result = parse_usages_response(fixture("kimi_usages_new.json"))

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,22 @@ from .base import (
     Detection, QuotaError, QuotaProvider, QuotaResult, QuotaWindow,
     as_number, parse_epoch, safe_text,
 )
-from .credentials import find_executable
+from .credentials import child_env, find_executable
 from .stdio_rpc import terminate_process_tree
+
+
+# `-p /usage` answers without an agent turn only since 1.1.11; older builds
+# would treat "/usage" as a prompt and spend quota, so they are never run.
+MIN_VERSION = (1, 1, 11)
+VERSION_TIMEOUT = 10.0
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_version(text: str) -> tuple[int, int, int] | None:
+    match = _VERSION_RE.search(text or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 WINDOW_LABELS = {"5h": "5 小时", "weekly": "每周", "daily": "每日", "monthly": "每月"}
@@ -105,6 +120,12 @@ class AntigravityProvider(QuotaProvider):
     default_interval = 900
     min_interval = 600
     timeout = 120.0
+    # Output shape of /usage is unconfirmed: only runs after the user opts in.
+    auto_enable = False
+
+    def __init__(self, settings: dict[str, Any] | None = None) -> None:
+        super().__init__(settings)
+        self._version_cache: tuple[str, float, tuple[int, int, int] | None] | None = None
 
     def executable(self) -> str | None:
         return find_executable(["agy"], env_name="DOTII_AGY_COMMAND")
@@ -119,10 +140,8 @@ class AntigravityProvider(QuotaProvider):
         path = self.executable()
         if not path:
             raise QuotaError("未找到 agy CLI", STATUS_UNAVAILABLE)
-        env = dict(os.environ)
-        # Best effort: discourage an interactive browser OAuth pop-up from a background poll.
-        env["BROWSER"] = "/usr/bin/true"
-        env.setdefault("NO_COLOR", "1")
+        env = self._env()
+        self._require_supported_version(path, env)
         try:
             process = subprocess.Popen(
                 [path, "-p", "/usage", "--output-format", "json", "--print-timeout", "90s"],
@@ -132,14 +151,74 @@ class AntigravityProvider(QuotaProvider):
             )
         except OSError as error:
             raise QuotaError(f"无法启动 agy：{error.strerror or type(error).__name__}", STATUS_UNAVAILABLE) from None
+        chunks: list[str] = []
+
+        def read_stdout() -> None:
+            try:
+                for chunk in iter(lambda: process.stdout.read(65536), ""):
+                    chunks.append(chunk)
+            except (OSError, ValueError):
+                pass  # pipe closed by terminate_process_tree
+
+        reader = threading.Thread(target=read_stdout, name="agy-stdout", daemon=True)
+        reader.start()
         try:
-            output, _ = process.communicate(timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            terminate_process_tree(process)
-            raise QuotaError("agy /usage 超时", STATUS_UNAVAILABLE) from None
+            try:
+                process.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                raise QuotaError("agy /usage 超时", STATUS_UNAVAILABLE) from None
+            # A helper that inherited stdout can hold the pipe open after agy exits;
+            # do not wait for EOF beyond a short grace period.
+            reader.join(2.0)
         finally:
-            # Reap MCP helpers that agy may leave in its session.
+            # Reap MCP helpers that agy may leave in its process group.
             terminate_process_tree(process)
+            reader.join(2.0)
+        output = "".join(chunks)
         if process.returncode not in (0, None) and not output.strip():
             raise QuotaError(f"agy 退出码 {process.returncode}", STATUS_ERROR)
         return parse_usage_report(extract_json_document(output))
+
+    @staticmethod
+    def _env() -> dict[str, str]:
+        env = child_env()
+        # Best effort: discourage an interactive browser OAuth pop-up from a background poll.
+        env["BROWSER"] = "/usr/bin/true"
+        env.setdefault("NO_COLOR", "1")
+        return env
+
+    def _require_supported_version(self, path: str, env: dict[str, str]) -> None:
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = 0.0
+        cached = self._version_cache
+        if cached and cached[0] == path and cached[1] == mtime:
+            version = cached[2]
+        else:
+            version = self._read_version(path, env)
+            self._version_cache = (path, mtime, version)
+        wanted = ".".join(map(str, MIN_VERSION))
+        if version is None:
+            raise QuotaError(f"无法确认 agy 版本（需要 ≥ {wanted}），为避免消耗额度未执行 /usage", STATUS_UNAVAILABLE)
+        if version < MIN_VERSION:
+            found = ".".join(map(str, version))
+            raise QuotaError(f"agy {found} 过旧（需要 ≥ {wanted}），为避免消耗额度未执行 /usage", STATUS_UNAVAILABLE)
+
+    @staticmethod
+    def _read_version(path: str, env: dict[str, str]) -> tuple[int, int, int] | None:
+        try:
+            process = subprocess.Popen(
+                [path, "--version"], cwd=str(Path.home()), env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", start_new_session=os.name == "posix",
+            )
+        except OSError:
+            return None
+        try:
+            output, _ = process.communicate(timeout=VERSION_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return None
+        finally:
+            terminate_process_tree(process, grace=1.0)
+        return parse_version(output[:2000])

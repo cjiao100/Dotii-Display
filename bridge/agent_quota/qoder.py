@@ -25,7 +25,7 @@ from .base import (
     Detection, QuotaError, QuotaProvider, QuotaResult, QuotaWindow,
     as_number, parse_epoch, safe_text,
 )
-from .credentials import find_executable
+from .credentials import child_env, find_executable
 from .stdio_rpc import terminate_process_tree
 
 
@@ -120,6 +120,8 @@ class QoderProvider(QuotaProvider):
     id = "qoder"
     name = "Qoder"
     kind = "cli"
+    # Not yet verified against a real account: only runs after the user opts in.
+    auto_enable = False
     default_interval = 900
     min_interval = 300
     timeout = 60.0
@@ -142,7 +144,7 @@ class QoderProvider(QuotaProvider):
                    "--no-session-persistence", "--strict-mcp-config"]
         try:
             process = subprocess.Popen(
-                command, cwd=str(Path.home()), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                command, cwd=str(Path.home()), env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
                 start_new_session=os.name == "posix",
             )
