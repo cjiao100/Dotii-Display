@@ -201,6 +201,9 @@ class QuotaProvider:
     id = "base"
     name = "Base"
     kind = "api"  # "api": needs a credential; "cli": needs a local executable
+    # Enabled by default when detected. Unverified providers set this False so
+    # they only run after the user turns them on explicitly.
+    auto_enable = True
     default_interval = 60
     min_interval = 60
     timeout = 10.0
@@ -233,6 +236,7 @@ class QuotaProvider:
             "id": self.id,
             "name": self.name,
             "kind": self.kind,
+            "auto_enable": self.auto_enable,
             "default_interval": self.default_interval,
             "min_interval": self.min_interval,
             "timeout": self.timeout,

@@ -609,6 +609,8 @@
   "暂无可用的 Agent 额度数据源": "No agent quota sources available",
   "Agent 额度设置已保存": "Agent quota setting saved",
   "正在刷新 Agent 额度": "Refreshing agent quotas",
+  "刚刚刷新过，稍后会自动再读取": "Refreshed moments ago; it will read again shortly",
+  "已检测到；该数据源尚未充分验证，默认关闭，可手动开启": "Detected; this source is not fully verified yet, so it is off by default. Turn it on to use it.",
   "刷新失败": "Refresh failed",
   "5 小时": "5 hours",
   "7 天": "7 days",

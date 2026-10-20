@@ -294,6 +294,92 @@ class ManagerTests(unittest.TestCase):
         started[0]()  # late result from the abandoned worker is discarded
         self.assertEqual(self.entry(manager)["status"], "error")
 
+    def test_settings_change_mid_fetch_clears_running_and_drops_result(self):
+        provider = _FakeProvider()
+        started = []
+        manager = AgentQuotaManager([provider], self.store, clock=lambda: self.now[0],
+                                    spawn=lambda target, name: started.append(target))
+        manager.tick()
+        self.assertTrue(self.entry(manager)["refreshing"])
+        manager.update_provider("fake", {"region": "b"})
+        started[0]()  # the old worker finishes after the settings change
+        entry = self.entry(manager)
+        self.assertFalse(entry["refreshing"])
+        self.assertNotEqual(entry["status"], "ok")  # stale-settings result dropped
+        manager.tick()  # immediately re-reads with the new settings
+        self.assertEqual(len(started), 2)
+        started[1]()
+        self.assertEqual(self.entry(manager)["status"], "ok")
+        self.now[0] += provider.timeout + 60
+        manager.tick()
+        self.assertNotEqual(self.entry(manager)["error"], "读取超时")
+
+    def test_disable_mid_fetch_never_reports_false_timeout(self):
+        provider = _FakeProvider()
+        started = []
+        manager = AgentQuotaManager([provider], self.store, clock=lambda: self.now[0],
+                                    spawn=lambda target, name: started.append(target))
+        manager.tick()
+        manager.update_provider("fake", {"enabled": False})
+        manager.tick()
+        self.assertEqual(self.entry(manager)["status"], "disabled")
+        started[0]()
+        self.assertFalse(self.entry(manager)["refreshing"])
+        self.now[0] += provider.timeout + 60
+        manager.tick()
+        entry = self.entry(manager)
+        self.assertEqual((entry["status"], entry["error"]), ("disabled", ""))
+        self.assertEqual(len(started), 1)
+
+    def test_manual_refresh_has_floor(self):
+        provider = _FakeProvider()
+        manager = self.manager(provider)
+        manager.tick()
+        self.assertEqual(provider.calls, 1)
+        self.now[0] += 5
+        self.assertEqual(manager.request_refresh("fake"), [])
+        manager.tick()
+        self.assertEqual(provider.calls, 1)
+        self.now[0] += 26  # 31 s after the last fetch started
+        manager.tick()
+        self.assertEqual(provider.calls, 2)  # the deferred refresh ran at the floor
+        self.now[0] += 31
+        self.assertEqual(manager.request_refresh(), ["fake"])
+        manager.tick()
+        self.assertEqual(provider.calls, 3)
+
+    def test_unverified_provider_stays_off_when_detected(self):
+        provider = _FakeProvider()
+        provider.auto_enable = False
+        manager = self.manager(provider)
+        manager.tick()
+        self.assertEqual(self.entry(manager)["status"], "disabled")
+        self.assertEqual(provider.calls, 0)
+        manager.update_provider("fake", {"enabled": True})
+        manager.tick()
+        self.assertEqual(self.entry(manager)["status"], "ok")
+
+    def test_overview_is_not_blocked_by_slow_detection(self):
+        release = threading.Event()
+        entered = threading.Event()
+        provider = _FakeProvider()
+
+        def slow_detect():
+            entered.set()
+            release.wait(5)
+            return Detection(True, True, "slow")
+        provider.detect = slow_detect
+        manager = self.manager(provider)
+        worker = threading.Thread(target=manager.tick)
+        worker.start()
+        self.assertTrue(entered.wait(2))
+        done = threading.Event()
+        threading.Thread(target=lambda: (manager.snapshot(), done.set())).start()
+        self.assertTrue(done.wait(1), "snapshot blocked while detect() was running")
+        release.set()
+        worker.join(3)
+        self.assertEqual(self.entry(manager)["status"], "ok")
+
     def test_run_loop_survives_and_stops(self):
         provider = _FakeProvider()
         manager = AgentQuotaManager([provider], self.store)

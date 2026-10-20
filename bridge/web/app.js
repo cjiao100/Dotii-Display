@@ -798,8 +798,9 @@ async function updateAgentProvider(providerId, changes) {
 
 async function refreshAgentQuota(providerId = null) {
   try {
-    await postAgentQuota("/api/v1/admin/agent-quota/refresh", providerId ? { id: providerId } : {});
-    showToast(t("正在刷新 Agent 额度"));
+    const result = await postAgentQuota("/api/v1/admin/agent-quota/refresh", providerId ? { id: providerId } : {});
+    const accepted = Array.isArray(result.accepted) ? result.accepted : [];
+    showToast(t(accepted.length ? "正在刷新 Agent 额度" : "刚刚刷新过，稍后会自动再读取"));
     window.setTimeout(() => refreshOverview(), 2500);
   } catch (error) {
     showToast(error.message || t("刷新失败"));

@@ -1301,6 +1301,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = self._read_admin_action()
+                result: dict[str, Any] = {"ok": True}
                 manager = self.bridge.agent_quota
                 if manager is None:
                     raise ValueError("Agent 额度功能未启用")
@@ -1315,8 +1316,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     provider_id = payload.get("id")
                     if provider_id is not None and not isinstance(provider_id, str):
                         raise ValueError("id must be a string")
-                    manager.request_refresh(provider_id)
-                self._send_json(HTTPStatus.OK, {"ok": True, "agent_quota": manager.snapshot()})
+                    result["accepted"] = manager.request_refresh(provider_id)
+                self._send_json(HTTPStatus.OK, {**result, "agent_quota": manager.snapshot()})
             except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return

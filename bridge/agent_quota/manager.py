@@ -23,6 +23,8 @@ from .base import (
 
 
 DETECT_TTL_SECONDS = 300
+MANUAL_REFRESH_FLOOR_SECONDS = 30
+OPT_IN_DETAIL = "已检测到；该数据源尚未充分验证，默认关闭，可手动开启"
 MAX_INTERVAL_SECONDS = 6 * 60 * 60
 WATCHDOG_GRACE_SECONDS = 30
 ALLOWED_SETTING_KEYS = {"enabled", "region", "interval_seconds"}
@@ -99,8 +101,14 @@ class _ProviderState:
         self.detection = Detection(False, False, "尚未检测")
         self.detected_at = 0.0
         self.next_due = 0.0
+        # A fetch in flight is identified by run_id (0 = idle). settings_generation
+        # changes when the user edits settings; a run started under an older
+        # generation still clears its own run_id on exit but its result is dropped.
+        self.run_id = 0
         self.running_since = 0.0
-        self.generation = 0
+        self.last_started = 0.0
+        self.settings_generation = 0
+        self.detect_token = 0
         self.last_success_epoch = 0
 
 
@@ -116,6 +124,7 @@ class AgentQuotaManager:
             self.states[provider.id] = _ProviderState(provider)
         self._spawn = spawn or self._spawn_thread
         self._wake = threading.Event()
+        self._run_counter = 0
         self._apply_settings(self.config.read())
 
     # ----- settings -----------------------------------------------------
@@ -138,20 +147,35 @@ class AgentQuotaManager:
             self.config.write(settings)
             state.provider.configure(merged)
             state.detected_at = 0.0
+            state.detect_token += 1
             state.next_due = 0.0
-            state.generation += 1
+            state.settings_generation += 1
         self._wake.set()
         return merged
 
-    def request_refresh(self, provider_id: str | None = None) -> None:
+    def request_refresh(self, provider_id: str | None = None) -> list[str]:
+        """Ask for an early re-read. A floor protects providers from click spam.
+
+        Returns the ids whose refresh was accepted immediately; the others are
+        deferred until MANUAL_REFRESH_FLOOR_SECONDS after their last fetch.
+        """
+        accepted: list[str] = []
         with self.lock:
             if provider_id is not None and provider_id not in self.states:
                 raise ValueError("unknown provider")
+            now = self.clock()
             for state in self.states.values():
-                if provider_id is None or state.provider.id == provider_id:
+                if provider_id is not None and state.provider.id != provider_id:
+                    continue
+                earliest = state.last_started + MANUAL_REFRESH_FLOOR_SECONDS if state.last_started else 0.0
+                if state.next_due > earliest:
+                    state.next_due = earliest
+                if earliest <= now:
                     state.detected_at = 0.0
-                    state.next_due = 0.0
+                    state.detect_token += 1
+                    accepted.append(state.provider.id)
         self._wake.set()
+        return accepted
 
     # ----- polling --------------------------------------------------------
     def _interval(self, provider: QuotaProvider) -> int:
@@ -164,49 +188,73 @@ class AgentQuotaManager:
         explicit = state.provider.settings.get("enabled")
         if isinstance(explicit, bool):
             return explicit
+        if not state.provider.auto_enable:
+            return False
         return state.detection.available or state.detection.configured
 
-    def _detect(self, state: _ProviderState, now: float) -> None:
-        if state.detected_at and now - state.detected_at < DETECT_TTL_SECONDS:
-            return
+    @staticmethod
+    def _safe_detect(provider: QuotaProvider) -> Detection:
         try:
-            state.detection = state.provider.detect()
+            return provider.detect()
         except Exception as error:  # noqa: BLE001 - detection must never crash the bridge
-            logging.warning("Agent 额度检测失败 %s：%s", state.provider.id, type(error).__name__)
-            state.detection = Detection(False, False, f"检测失败：{type(error).__name__}")
-        state.detected_at = now
+            logging.warning("Agent 额度检测失败 %s：%s", provider.id, type(error).__name__)
+            return Detection(False, False, f"检测失败：{type(error).__name__}")
 
     def tick(self) -> None:
         now = self.clock()
+        # Detection may spawn subprocesses (e.g. the macOS `security` tool), so it
+        # runs without holding the lock; the overview never waits on it.
         with self.lock:
-            for state in self.states.values():
-                provider = state.provider
-                self._detect(state, now)
-                if state.running_since:
-                    if now - state.running_since > provider.timeout + WATCHDOG_GRACE_SECONDS:
-                        # Abandon a hung worker; its late result is discarded by generation.
-                        state.generation += 1
-                        state.running_since = 0.0
-                        self._set_failure(state, QuotaError("读取超时", STATUS_ERROR), now)
-                        state.next_due = now + self._interval(provider)
-                    continue
-                if not self._enabled(state):
-                    state.entry = empty_entry(provider.id, provider.name, STATUS_DISABLED, state.detection.detail)
-                    continue
-                if not state.detection.configured:
-                    status = STATUS_UNAVAILABLE if provider.kind == "cli" else STATUS_NOT_CONFIGURED
-                    state.entry = empty_entry(provider.id, provider.name, status, state.detection.detail)
-                    state.next_due = 0.0
-                    continue
-                if now < state.next_due:
-                    continue
-                state.running_since = now
-                if state.entry["status"] in {STATUS_DISABLED, STATUS_NOT_CONFIGURED, STATUS_UNAVAILABLE}:
-                    state.entry = empty_entry(provider.id, provider.name, STATUS_PENDING, "正在读取")
-                generation = state.generation
-                self._spawn(lambda s=state, g=generation: self._run(s, g), f"agent-quota-{provider.id}")
+            pending = [
+                (state, state.detect_token) for state in self.states.values()
+                if not state.detected_at or now - state.detected_at >= DETECT_TTL_SECONDS
+            ]
+        results = [(state, token, self._safe_detect(state.provider)) for state, token in pending]
+        with self.lock:
+            for state, token, detection in results:
+                state.detection = detection
+                # A settings change during detection forces another detection next tick.
+                state.detected_at = now if token == state.detect_token else 0.0
+            self._schedule(now)
 
-    def _run(self, state: _ProviderState, generation: int) -> None:
+    def _schedule(self, now: float) -> None:
+        for state in self.states.values():
+            provider = state.provider
+            enabled = self._enabled(state)
+            if state.run_id and now - state.running_since > provider.timeout + WATCHDOG_GRACE_SECONDS:
+                # Abandon a hung worker; its late result is discarded by run id.
+                state.run_id = 0
+                state.running_since = 0.0
+                state.next_due = now + self._interval(provider)
+                if enabled:
+                    self._set_failure(state, QuotaError("读取超时", STATUS_ERROR), now)
+            if not enabled:
+                detail = state.detection.detail
+                if (not provider.auto_enable and "enabled" not in provider.settings
+                        and (state.detection.available or state.detection.configured)):
+                    detail = OPT_IN_DETAIL
+                state.entry = empty_entry(provider.id, provider.name, STATUS_DISABLED, detail)
+                continue
+            if state.run_id:
+                continue
+            if not state.detection.configured:
+                status = STATUS_UNAVAILABLE if provider.kind == "cli" else STATUS_NOT_CONFIGURED
+                state.entry = empty_entry(provider.id, provider.name, status, state.detection.detail)
+                state.next_due = 0.0
+                continue
+            if now < state.next_due:
+                continue
+            self._run_counter += 1
+            run_id = self._run_counter
+            state.run_id = run_id
+            state.running_since = now
+            state.last_started = now
+            if state.entry["status"] in {STATUS_DISABLED, STATUS_NOT_CONFIGURED, STATUS_UNAVAILABLE}:
+                state.entry = empty_entry(provider.id, provider.name, STATUS_PENDING, "正在读取")
+            generation = state.settings_generation
+            self._spawn(lambda s=state, r=run_id, g=generation: self._run(s, r, g), f"agent-quota-{provider.id}")
+
+    def _run(self, state: _ProviderState, run_id: int, generation: int) -> None:
         provider = state.provider
         try:
             entry = provider.fetch_quota()
@@ -219,9 +267,14 @@ class AgentQuotaManager:
             entry, error = None, QuotaError(f"内部错误：{type(failure).__name__}", STATUS_ERROR)
         now = self.clock()
         with self.lock:
-            if generation != state.generation:
-                return
+            if run_id != state.run_id:
+                return  # abandoned by the watchdog; a newer run may be in flight
+            state.run_id = 0
             state.running_since = 0.0
+            if generation != state.settings_generation or not self._enabled(state):
+                # Settings changed mid-fetch: drop the result; next tick re-reads if enabled.
+                state.next_due = 0.0
+                return
             state.next_due = now + self._interval(provider)
             if entry is not None:
                 entry["detail"] = entry.get("detail") or state.detection.detail
@@ -279,7 +332,8 @@ class AgentQuotaManager:
                     "interval_seconds": self._interval(provider),
                     "region": provider.region,
                     "regions": list(provider.regions),
-                    "refreshing": bool(state.running_since),
+                    "refreshing": bool(state.run_id),
+                    "auto_enable": provider.auto_enable,
                     "last_success_epoch": state.last_success_epoch,
                 })
                 providers.append(entry)
