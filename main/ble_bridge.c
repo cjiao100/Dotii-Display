@@ -38,7 +38,8 @@
 #define DATA_HEADER 2
 #define DATA_MAX_FRAME (64 * 1024)    /* body bytes, compressed or plain */
 #define DATA_FRAME_QUEUE 3
-#define CREDIT_EVERY_PACKETS 4
+#define CREDIT_EVERY_PACKETS 4        /* default when RESET carries no window hint */
+#define CREDIT_FLUSH_MS 20            /* credit the unacknowledged tail of a burst */
 #define PKT_DATA 0x01
 #define PKT_RESET 0x02
 #define PKT_CREDIT 0x03
@@ -91,6 +92,7 @@ typedef struct {
     uint32_t seq_gaps;
     uint32_t queue_drops;
     uint32_t credits_sent;
+    uint32_t credit_flushes;  /* credits sent by the tail flush timer */
     uint32_t credit_failures;
     uint32_t tx_frames;
     uint32_t tx_packets;
@@ -113,6 +115,8 @@ static uint8_t s_rx_seq_expected;
 static uint32_t s_rx_total;
 static uint8_t s_reset_epoch;
 static unsigned s_packets_since_credit;
+static unsigned s_credit_every = CREDIT_EVERY_PACKETS;
+static struct ble_npl_callout s_credit_callout;
 static uint8_t s_tx_seq;
 static dtu_stream_t s_stream;
 static QueueHandle_t s_frames;
@@ -314,7 +318,23 @@ static void reset_data_channel(void)
     s_rx_seq_expected = 0;
     s_rx_total = 0;
     s_packets_since_credit = 0;
+    s_credit_every = CREDIT_EVERY_PACKETS;
     s_reset_epoch++;
+}
+
+/* RESET / BENCH_RESET may carry the sender's credit window in packets
+   ([type][0][window]). Credit at least twice per window so a small window
+   never waits on a credit the device would only send after more packets. */
+static void set_credit_window(uint8_t window_packets)
+{
+    if (window_packets == 0) {
+        s_credit_every = CREDIT_EVERY_PACKETS;
+        return;
+    }
+    unsigned every = window_packets / 2;
+    if (every < 1) every = 1;
+    if (every > CREDIT_EVERY_PACKETS) every = CREDIT_EVERY_PACKETS;
+    s_credit_every = every;
 }
 
 static void reset_bench(void)
@@ -348,6 +368,16 @@ static void send_credit(uint16_t conn_handle)
     s_packets_since_credit = 0;
 }
 
+/* Host task (default event queue), CREDIT_FLUSH_MS after the last DATA/BENCH
+   packet: acknowledge a tail shorter than s_credit_every so drain() finishes. */
+static void credit_flush(struct ble_npl_event *event)
+{
+    (void)event;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_packets_since_credit == 0) return;
+    s_stats.credit_flushes++;
+    send_credit(s_conn_handle);
+}
+
 static void send_nak(uint16_t conn_handle, uint8_t expected, uint8_t received)
 {
     uint8_t packet[4] = {PKT_NAK, 0, expected, received};
@@ -365,14 +395,11 @@ static int handle_data_write(uint16_t conn_handle, struct os_mbuf *om)
     }
     const uint8_t type = s_data_rx_packet[0];
     const uint8_t seq = s_data_rx_packet[1];
-    if (type == PKT_RESET) {
+    if (type == PKT_RESET || type == PKT_BENCH_RESET) {
+        if (type == PKT_BENCH_RESET) reset_bench();
+        ble_npl_callout_stop(&s_credit_callout);
         reset_data_channel();
-        send_credit(conn_handle);
-        return 0;
-    }
-    if (type == PKT_BENCH_RESET) {
-        reset_bench();
-        reset_data_channel();
+        set_credit_window(length > DATA_HEADER ? s_data_rx_packet[DATA_HEADER] : 0);
         send_credit(conn_handle);
         return 0;
     }
@@ -400,7 +427,12 @@ static int handle_data_write(uint16_t conn_handle, struct os_mbuf *om)
         s_stats.bench_packets++;
         s_stats.bench_bytes += payload;
     }
-    if (++s_packets_since_credit >= CREDIT_EVERY_PACKETS || frames > 0) send_credit(conn_handle);
+    if (++s_packets_since_credit >= s_credit_every || frames > 0) send_credit(conn_handle);
+    if (s_packets_since_credit > 0) {
+        ble_npl_callout_reset(&s_credit_callout, ble_npl_time_ms_to_ticks32(CREDIT_FLUSH_MS));
+    } else {
+        ble_npl_callout_stop(&s_credit_callout);
+    }
     return 0;
 }
 
@@ -544,6 +576,8 @@ void ble_bridge_fill_diag(cJSON *object)
         cJSON_AddNumberToObject(ble, "alloc_errors", s_stream.alloc_errors);
         cJSON_AddNumberToObject(ble, "queue_drops", s_stats.queue_drops);
         cJSON_AddNumberToObject(ble, "credits_sent", s_stats.credits_sent);
+        cJSON_AddNumberToObject(ble, "credit_flushes", s_stats.credit_flushes);
+        cJSON_AddNumberToObject(ble, "credit_every", s_credit_every);
         cJSON_AddNumberToObject(ble, "credit_failures", s_stats.credit_failures);
         cJSON_AddNumberToObject(ble, "tx_frames", s_stats.tx_frames);
         cJSON_AddNumberToObject(ble, "tx_packets", s_stats.tx_packets);
@@ -586,10 +620,11 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         connectivity_get_bridge_summary(bridge, sizeof(bridge));
         char status[RESPONSE_MAX];
         snprintf(status, sizeof(status),
-                 "{\"v\":1,\"name\":\"Dotii\",\"firmware\":\"%s\",\"provisioned\":%s,\"wifi\":%s,\"bridge\":\"%s\",\"sync\":1}",
+                 "{\"v\":1,\"name\":\"Dotii\",\"firmware\":\"%s\",\"provisioned\":%s,\"wifi\":%s,\"bridge\":\"%s\",\"sync\":1,\"ble_ready\":%s}",
                  esp_app_get_description()->version,
                  device_config_get()->provisioned ? "true" : "false",
-                 connectivity_is_wifi_connected() ? "true" : "false", bridge);
+                 connectivity_is_wifi_connected() ? "true" : "false", bridge,
+                 ble_bridge_session_ready(ble_bridge_session()) ? "true" : "false");
         return os_mbuf_append(ctxt->om, status, strlen(status)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -737,6 +772,7 @@ static void session_end(void)
 {
     ble_npl_callout_stop(&s_security_callout);
     ble_npl_callout_stop(&s_link_callout);
+    ble_npl_callout_stop(&s_credit_callout);
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_tx_subscribed = false;
     s_stats.encrypted = false;
@@ -887,6 +923,7 @@ esp_err_t ble_bridge_prepare(void)
     dtu_stream_init(&s_stream, DATA_MAX_FRAME, frame_alloc, heap_caps_free, deliver_frame, NULL);
     ble_npl_callout_init(&s_link_callout, nimble_port_get_dflt_eventq(), tune_link, NULL);
     ble_npl_callout_init(&s_security_callout, nimble_port_get_dflt_eventq(), security_timer, NULL);
+    ble_npl_callout_init(&s_credit_callout, nimble_port_get_dflt_eventq(), credit_flush, NULL);
     s_prepared = true;
     ESP_LOGI(TAG, "Bluetooth controller reserved");
     return ESP_OK;

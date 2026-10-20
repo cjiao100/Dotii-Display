@@ -1119,6 +1119,11 @@ typedef enum {
 static int64_t s_ble_last_sync;
 static int64_t s_wifi_last_data;
 static uint32_t s_ble_auth_session;
+/* First time the bridge task saw the current BLE session; a fresh connection
+   is still pairing/subscribing and must not wait behind a snapshot fetch. */
+#define BLE_HANDSHAKE_GRACE_US (15 * 1000000LL)
+static uint32_t s_ble_seen_session;
+static int64_t s_ble_seen_at;
 static uint32_t s_ble_data_session;
 static uint32_t s_ble_nonce_session;
 static char s_ble_nonce[33];
@@ -1651,7 +1656,13 @@ static void bridge_task(void *argument)
         if (s_wifi_connected) {
             const uint32_t ble_session = ble_bridge_session();
             const bool ble_link_ready = ble_bridge_session_ready(ble_session);
-            const bool ble_handshaking = ble_link_ready && !ble_active;
+            if (ble_session != s_ble_seen_session) {
+                s_ble_seen_session = ble_session;
+                s_ble_seen_at = esp_timer_get_time();
+            }
+            const bool ble_connecting = ble_session != 0 &&
+                                        esp_timer_get_time() - s_ble_seen_at < BLE_HANDSHAKE_GRACE_US;
+            const bool ble_handshaking = (ble_link_ready || ble_connecting) && !ble_active;
             if (ble_active || ble_handshaking || ble_bridge_pending()) {
                 /* Prefer the short ping (and skip the 10 s snapshot) while a BLE
                    session is authenticating or has frames waiting, so hello/auth
