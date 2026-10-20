@@ -16,7 +16,7 @@ from runtime_paths import project_version
 class VersionTests(unittest.TestCase):
     def test_api_and_firmware_share_the_cmake_version(self):
         version = project_version(ROOT)
-        self.assertEqual(version, "1.2")
+        self.assertEqual(version, "1.3")
         self.assertEqual(APP_VERSION, version)
         self.assertEqual(_project_version(ROOT), version)
         self.assertEqual(BridgeHandler.server_version, f"StateDisplayBridge/{version}")
