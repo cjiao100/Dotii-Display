@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "app_state.c"
         "connectivity.c"
+        "dtu_stream.c"
         "usb_transport.c"
         "ui_language.c"
         "device_config.c"
