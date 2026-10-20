@@ -127,13 +127,32 @@ class QoderProvider(QuotaProvider):
     timeout = 60.0
 
     def executable(self) -> str | None:
-        return find_executable(["qodercli"], env_name="DOTII_QODER_COMMAND")
+        # Mirror the official qoder dispatcher CLI lookup: PATH, then
+        # ~/.local/bin/qodercli (handled by find_executable), then the nested
+        # ~/.qoder/bin/qodercli/qodercli install location.
+        nested = Path.home() / ".qoder" / "bin" / "qodercli" / "qodercli"
+        return find_executable(["qodercli"], extra=[nested], env_name="DOTII_QODER_COMMAND")
+
+    @staticmethod
+    def ide_present() -> bool:
+        if (Path.home() / ".qoder").is_dir():
+            return True
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            try:
+                if any(app.name.startswith("Qoder") and app.suffix == ".app" for app in root.iterdir()):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def detect(self) -> Detection:
         path = self.executable()
-        if not path:
-            return Detection(False, False, "未检测到 qodercli")
-        return Detection(True, True, f"已检测到 qodercli（{path}）；登录状态由 qodercli 自己管理，开启后读取时确认", "cli")
+        if path:
+            return Detection(True, True, f"已检测到 qodercli（{path}）；登录状态由 qodercli 自己管理，开启后读取时确认", "cli")
+        if self.ide_present():
+            # The IDE alone has no headless quota path; the Qoder CLI is required.
+            return Detection(True, False, "已检测到 Qoder，但未安装 Qoder CLI（额度读取需要 qodercli）")
+        return Detection(False, False, "未检测到 Qoder")
 
     def fetch(self) -> QuotaResult:
         path = self.executable()

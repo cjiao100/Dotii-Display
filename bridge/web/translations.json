@@ -597,6 +597,8 @@
   "需要登录": "Sign-in required",
   "未检测到 agy CLI": "agy CLI not detected",
   "未检测到 qodercli": "qodercli not detected",
+  "未检测到 Qoder": "Qoder not detected",
+  "已检测到 Qoder，但未安装 Qoder CLI（额度读取需要 qodercli）": "Qoder detected, but the Qoder CLI is not installed (quota readout needs qodercli)",
   "未检测到": "Not detected",
   "登录已失效": "Sign-in expired",
   "已检测到 ZCode，但它的 API Key 加密保存，暂不支持自动读取": "ZCode found, but its API key is stored encrypted and cannot be read automatically yet",

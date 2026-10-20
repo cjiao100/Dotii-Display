@@ -161,6 +161,45 @@ class QoderParserTests(unittest.TestCase):
             self.assertEqual(caught.exception.status, "auth_error")
 
 
+class QoderDetectionTests(unittest.TestCase):
+    @unittest.skipIf(os.name != "posix", "fake CLI uses a shebang script")
+    def test_nested_qoder_bin_is_found(self):
+        with temporary_directory() as folder:
+            home = Path(folder)
+            nested = home / ".qoder" / "bin" / "qodercli"
+            nested.mkdir(parents=True)
+            cli = fake_cli(nested, "qodercli", "pass")
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch.dict("os.environ", {}, clear=True):
+                provider = QoderProvider()
+                self.assertEqual(provider.executable(), str(cli))
+                detection = provider.detect()
+                self.assertTrue(detection.configured)
+                self.assertIn("qodercli", detection.detail)
+
+    def test_ide_without_cli_reports_missing_cli(self):
+        with temporary_directory() as folder:
+            home = Path(folder)
+            (home / ".qoder").mkdir()  # IDE data dir, but no qodercli anywhere
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch("agent_quota.qoder.find_executable", return_value=None), \
+                    mock.patch.dict("os.environ", {}, clear=True):
+                detection = QoderProvider().detect()
+                self.assertEqual((detection.available, detection.configured), (True, False))
+                self.assertEqual(detection.detail, "已检测到 Qoder，但未安装 Qoder CLI（额度读取需要 qodercli）")
+
+    def test_nothing_installed_reports_not_detected(self):
+        with temporary_directory() as folder:
+            home = Path(folder)
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch("agent_quota.qoder.find_executable", return_value=None), \
+                    mock.patch("agent_quota.qoder.QoderProvider.ide_present", return_value=False), \
+                    mock.patch.dict("os.environ", {}, clear=True):
+                detection = QoderProvider().detect()
+                self.assertEqual((detection.available, detection.configured, detection.detail),
+                                 (False, False, "未检测到 Qoder"))
+
+
 class RegistryTests(unittest.TestCase):
     def test_unverified_cli_providers_default_off(self):
         from agent_quota import default_providers
