@@ -1,0 +1,22 @@
+{
+  "conversation_id": "",
+  "status": "SUCCESS",
+  "response": "",
+  "duration_seconds": 1.2,
+  "num_turns": 0,
+  "command": {
+    "name": "usage",
+    "data": {
+      "groups": [
+        {"name": "Gemini Models", "buckets": [
+          {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.86, "reset_time": "2026-10-26T00:00:00Z"},
+          {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.95, "reset_time": "2026-10-20T08:00:00Z"}
+        ]},
+        {"name": "Claude and GPT models", "buckets": [
+          {"id": "other-weekly", "window": "weekly", "remaining_fraction": 0.4, "reset_time": "2026-10-26T00:00:00Z"},
+          {"id": "other-5h", "window": "5h", "remaining_fraction": 0.1, "disabled": true}
+        ]}
+      ]
+    }
+  }
+}

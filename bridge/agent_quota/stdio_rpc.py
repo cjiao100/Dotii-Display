@@ -65,7 +65,13 @@ class StdioJsonRpc:
 
     def _read(self) -> None:
         assert self.process is not None and self.process.stdout is not None
-        for line in self.process.stdout:
+        try:
+            self._read_lines(self.process.stdout)
+        except (OSError, ValueError):
+            pass  # pipe closed during shutdown
+
+    def _read_lines(self, stdout: Any) -> None:
+        for line in stdout:
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -135,6 +141,18 @@ class StdioJsonRpc:
 
 def terminate_process_tree(process: subprocess.Popen[Any], grace: float = 3.0) -> None:
     """Terminate the child and anything it spawned in its session (MCP helpers etc.)."""
+    try:
+        _terminate(process, grace)
+    finally:
+        for stream in (process.stdin, process.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+
+def _terminate(process: subprocess.Popen[Any], grace: float) -> None:
     if process.poll() is not None:
         return
     try:

@@ -633,5 +633,15 @@
   "未找到 grok CLI": "grok CLI not found",
   "grok CLI 未登录 grok.com，请先运行 grok login": "grok CLI is not signed in to grok.com; run grok login",
   "grok CLI 不支持 _x.ai/billing（-32601），请升级 grok": "grok CLI does not support _x.ai/billing (-32601); update grok",
-  "CLI 进程提前退出": "CLI process exited early"
+  "CLI 进程提前退出": "CLI process exited early",
+  "套餐 Credits": "Plan credits",
+  "加油包 Credits": "Add-on credits",
+  "共享额度": "Shared quota",
+  "组织资源包": "Org resource package",
+  "总用量": "Total usage",
+  "未找到 agy CLI": "agy CLI not found",
+  "未找到 qodercli": "qodercli not found",
+  "agy /usage 超时": "agy /usage timed out",
+  "Qoder get_usage_info 超时": "Qoder get_usage_info timed out",
+  "qodercli 提前退出": "qodercli exited early"
 }
