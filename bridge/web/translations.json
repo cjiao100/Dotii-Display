@@ -626,5 +626,12 @@
   "鉴权失败（HTTP 401），请检查凭据": "Authentication failed (HTTP 401); check the credential",
   "鉴权失败（HTTP 403），请检查凭据": "Authentication failed (HTTP 403); check the credential",
   "额度接口不存在（HTTP 404）": "Quota endpoint not found (HTTP 404)",
-  "Kimi Code 登录已过期，请运行 Kimi Code CLI 重新登录（Dotii 不会刷新令牌）": "Kimi Code sign-in expired; run the Kimi Code CLI to sign in again (Dotii never refreshes tokens)"
+  "Kimi Code 登录已过期，请运行 Kimi Code CLI 重新登录（Dotii 不会刷新令牌）": "Kimi Code sign-in expired; run the Kimi Code CLI to sign in again (Dotii never refreshes tokens)",
+  "按需用量": "On-demand usage",
+  "当前周期": "Current period",
+  "每日": "Daily",
+  "未找到 grok CLI": "grok CLI not found",
+  "grok CLI 未登录 grok.com，请先运行 grok login": "grok CLI is not signed in to grok.com; run grok login",
+  "grok CLI 不支持 _x.ai/billing（-32601），请升级 grok": "grok CLI does not support _x.ai/billing (-32601); update grok",
+  "CLI 进程提前退出": "CLI process exited early"
 }
