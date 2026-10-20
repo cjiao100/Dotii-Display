@@ -186,7 +186,13 @@ class BleLink:
         self.seq = 0
         self.credits.reset()
         self.credit_epoch = None  # accept the epoch from the CREDIT that follows RESET
-        await self.write(bytes((PKT_BENCH_RESET if bench else PKT_RESET, 0)), True)
+        # Byte 2 tells the firmware our window in packets so it credits often
+        # enough (older firmware ignores it and credits every 4 + tail flush).
+        await self.write(bytes((PKT_BENCH_RESET if bench else PKT_RESET, 0, self.window_packets)), True)
+
+    @property
+    def window_packets(self) -> int:
+        return max(1, min(255, self.credits.window // max(1, self.chunk)))
 
     async def send_stream(self, stream: bytes, kind: int = PKT_DATA) -> None:
         packets, self.seq = packetize(stream, self.chunk, self.seq, kind)

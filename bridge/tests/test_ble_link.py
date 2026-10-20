@@ -105,7 +105,7 @@ class LinkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BleLinkError, "sequence_gap"):
             await link.send_stream(b"y" * 50)
         await link.reset()
-        self.assertEqual(writes[-1], bytes((PKT_RESET, 0)))
+        self.assertEqual(writes[-1], bytes((PKT_RESET, 0, 255)))  # window 10_000 B / 10 B capped
         self.assertIsNone(link.error)
 
     async def test_notifications_reassemble_and_gap_drops_partial_frame(self):

@@ -25,6 +25,8 @@ Usage (repository root, bridge virtualenv with bleak):
         --bytes 65536 --json .codex/ble_bench.json [--snapshot]
 
 The token file is read but never printed, logged or written to the JSON.
+Exit codes: 0 ok, 2 no data channel, 3 encryption insufficient,
+4 device impersonation, 5 hello unanswered (after one retry).
 macOS asks for Bluetooth permission for the terminal on first use, and the
 board requests pairing (Just Works) right after connecting.
 """
@@ -44,7 +46,8 @@ sys.path.insert(0, str(ROOT / "bridge"))
 from ble_caps import cap_snapshot_for_ble  # noqa: E402
 from ble_link import PKT_BENCH, BleLink, BleLinkError, payload_size  # noqa: E402
 from bluetooth_bridge import (  # noqa: E402
-    DATA_RX_UUID, DATA_TX_UUID, SERVICE_UUID, STATUS_UUID, AsyncDtuClient, BleSyncError, ble_mutual_auth,
+    DATA_RX_UUID, DATA_TX_UUID, SERVICE_UUID, STATUS_UUID, AsyncDtuClient, BleSyncError, ble_hello,
+    ble_mutual_auth, wait_link_ready,
 )
 from dtu_protocol import DeviceError, DtuSession  # noqa: E402
 
@@ -95,7 +98,7 @@ LINK_KEYS = ("mtu", "preferred_mtu", "conn_interval_ms", "conn_latency", "superv
              "bonded", "key_size", "tx_phy", "rx_phy", "dle_tx_octets", "dle_tx_time", "dle_rx_octets",
              "dle_rx_time", "dle_request_rc", "conn_update_rc", "phy_request_rc", "mtu_request_rc",
              "security_rc", "security_requests", "enc_status", "enc_changes", "enc_failures",
-             "repeat_pairings", "bond_resets")
+             "repeat_pairings", "bond_resets", "credits_sent", "credit_flushes", "credit_every")
 RC_KEYS = ("dle_request_rc", "conn_update_rc", "phy_request_rc", "mtu_request_rc", "security_rc", "enc_status")
 
 
@@ -113,7 +116,7 @@ async def authenticate(rpc: AsyncDtuClient, token: str) -> dict[str, Any]:
     Returns a JSON-safe summary (never the token): bound, authenticated,
     diag_allowed, device_id, firmware, error, note.
     """
-    hello = await rpc.call("hello")
+    hello = await ble_hello(rpc)
     device_id = str(hello.get("device_id") or "")
     summary: dict[str, Any] = {
         "device_id": device_id, "firmware": hello.get("firmware"), "bound": bool(hello.get("bound")),
@@ -171,7 +174,9 @@ async def bench_once(rpc: AsyncDtuClient, link: BleLink, chunk: int, total: int,
     heap = None
     if diag_allowed:
         diag = await rpc.call("ble_diag")
-        bench = (diag.get("ble") or {}).get("bench") or {}
+        ble = diag.get("ble") or {}
+        bench = ble.get("bench") or {}
+        bench["credit_every"] = ble.get("credit_every")
         heap = diag.get("heap")
     await link.reset()
     gaps = bench.get("gaps")
@@ -186,6 +191,7 @@ async def bench_once(rpc: AsyncDtuClient, link: BleLink, chunk: int, total: int,
         "device_bytes_per_s": bench.get("bytes_per_s"),
         "lost": None if gaps is None else (gaps != 0 or bench.get("bytes") != total),
         "mac_naks": link.naks,
+        "device_credit_every": bench.get("credit_every"),
         "heap": heap,
     }
 
@@ -244,9 +250,21 @@ async def main(args: argparse.Namespace) -> int:
             result["error"] = "encryption_insufficient"
             exit_code = 3
         else:
+            ready = await wait_link_ready(lambda: client.read_gatt_char(STATUS_UUID), timeout=args.ready_timeout)
+            result["ble_ready"] = ready
+            if ready is False:
+                print(f"device did not report an encrypted, subscribed link within {args.ready_timeout:.0f}s; "
+                      "trying hello anyway")
             await link.reset()
             await asyncio.sleep(args.settle)  # firmware tunes the link ~1 s after connect
-            auth = await authenticate(rpc, token)
+            try:
+                auth = await authenticate(rpc, token)
+            except BleSyncError as error:
+                result["error"] = f"hello_{error}"
+                print(f"hello failed twice ({error}); the board did not answer on the data channel")
+                if args.json:
+                    Path(args.json).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                return 5
             result["auth"] = auth
             print(f"device {auth['device_id']} bound={auth['bound']} authenticated={auth['authenticated']}"
                   + (f" error={auth['error']}" if auth["error"] else ""))
@@ -304,6 +322,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--windows", default="2,4,8,16", help="credit windows in packets for wwr")
     parser.add_argument("--settle", type=float, default=2.0, help="seconds to wait for link tuning")
     parser.add_argument("--pair-wait", type=float, default=8.0, help="seconds to wait for pairing before retrying")
+    parser.add_argument("--ready-timeout", type=float, default=8.0,
+                        help="seconds to wait for STATUS ble_ready (encrypted + subscribed) before hello")
     parser.add_argument("--token-file", help="file containing the bound bridge token (never printed)")
     parser.add_argument("--snapshot", action="store_true", help="also send a compressed snapshot (needs auth)")
     parser.add_argument("--json", help="write the result (no token) to this file")

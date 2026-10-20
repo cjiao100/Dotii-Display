@@ -16,7 +16,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from ble_caps import cap_snapshot_for_ble, snapshot_digest
 from ble_link import BleLink, BleLinkError, payload_size
@@ -655,6 +655,48 @@ async def ble_mutual_auth(rpc: "AsyncDtuClient", token: str, device_id: str, cha
     return reply
 
 
+BLE_READY_TIMEOUT = 6.0
+BLE_READY_POLL = 0.25
+BLE_LEGACY_SETTLE = 1.0
+
+
+async def wait_link_ready(read_status: Callable[[], Awaitable[Any]], *, timeout: float = BLE_READY_TIMEOUT,
+                          interval: float = BLE_READY_POLL, legacy_settle: float = BLE_LEGACY_SETTLE) -> bool | None:
+    """Poll STATUS until the firmware reports ble_ready (encrypted + DATA_TX subscribed).
+
+    True when ready, False after ``timeout``; None when the firmware predates
+    the field (then just wait ``legacy_settle`` for pairing to finish).
+    STATUS needs no encryption and carries no secrets.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            status = json.loads(bytes(await read_status()).decode("utf-8"))
+        except Exception:  # bleak backend errors / partial reads: try again
+            status = {}
+        if isinstance(status, dict) and "ble_ready" in status:
+            if status["ble_ready"] is True:
+                return True
+        elif isinstance(status, dict) and status:
+            await asyncio.sleep(legacy_settle)
+            return None
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(interval)
+
+
+async def ble_hello(rpc: "AsyncDtuClient", attempts: int = 2) -> dict[str, Any]:
+    """hello, retried once on timeout (the first can queue behind a busy firmware task)."""
+    for attempt in range(attempts):
+        try:
+            return await rpc.call("hello")
+        except BleSyncError as error:
+            if str(error) != "timeout" or attempt == attempts - 1:
+                raise
+    raise BleSyncError("timeout")
+
+
 class AsyncDtuClient:
     """Request/reply over a BleLink on one asyncio loop."""
 
@@ -885,6 +927,7 @@ class BleSyncWorker:
             link = BleLink(write, chunk=chunk)
             rpc = AsyncDtuClient(link, DtuSession(on_event=self._on_event))
             await client.start_notify(DATA_TX_UUID, link.on_notify)
+            await wait_link_ready(lambda: client.read_gatt_char(STATUS_UUID))
             await link.reset()
             await self._handshake(rpc)
             self.connected = True
@@ -900,7 +943,7 @@ class BleSyncWorker:
                 pass
 
     async def _handshake(self, rpc: AsyncDtuClient) -> None:
-        hello = await rpc.call("hello")
+        hello = await ble_hello(rpc)
         device_id = str(hello.get("device_id") or "")
         if not device_id or hello.get("product") != "Dotii" or hello.get("protocol") != 1:
             raise BleSyncError("unsupported_device")

@@ -1,6 +1,7 @@
 """In-memory model of the Dotii BLE data channel firmware for unit tests.
 
-Mirrors main/ble_bridge.c (packet layer, credits every 4 packets, NAK) and
+Mirrors main/ble_bridge.c (packet layer, credits every min(4, window/2)
+packets from the RESET window hint, 20 ms tail flush, NAK) and
 the BLE half of process_request() in main/connectivity.c.
 """
 from __future__ import annotations
@@ -26,14 +27,24 @@ STATUS = "7b4e0004-4db4-4c72-a729-ea5187241a43"
 class FakeDotiiFirmware:
     def __init__(self, *, token: str = "local-test-token-0001", device_id: str = "AABBCCDDEEFF",
                  bound: bool = True, want_data: bool = True, send_credits: bool = True,
-                 credit_delay: float = 0.0, credit_every: int = 4, mtu: int = 247):
+                 credit_delay: float = 0.0, credit_every: int = 4, mtu: int = 247,
+                 honor_window_hint: bool = True, flush_ms: float | None = 20.0,
+                 ready_after_reads: int = 0, legacy_status: bool = False):
         self.token = token
         self.device_id = device_id
         self.bound = bound
         self.want_data = want_data
         self.send_credits = send_credits
         self.credit_delay = credit_delay
+        self.default_credit_every = credit_every
         self.credit_every = credit_every
+        self.honor_window_hint = honor_window_hint
+        self.flush_ms = flush_ms
+        self.flush_handle: asyncio.TimerHandle | None = None
+        self.flushes = 0
+        self.ready_after_reads = ready_after_reads
+        self.status_reads = 0
+        self.legacy_status = legacy_status
         self.mtu = mtu
         self.notify: Callable[[Any, bytes], None] | None = None
         self.decoder = FrameDecoder()
@@ -61,7 +72,23 @@ class FakeDotiiFirmware:
         self.packets_since_credit = 0
         self.received_bytes = 0
         self.credited = 0
+        self.credit_every = getattr(self, "default_credit_every", 4)
+        handle = getattr(self, "flush_handle", None)
+        if handle is not None:
+            handle.cancel()
+        self.flush_handle = None
         self.reset_epoch = getattr(self, "reset_epoch", 0) + 1
+
+    def set_credit_window(self, window_packets: int) -> None:
+        if not self.honor_window_hint or window_packets == 0:
+            return
+        self.credit_every = max(1, min(4, window_packets // 2))
+
+    def _flush(self) -> None:
+        self.flush_handle = None
+        if self.packets_since_credit:
+            self.flushes += 1
+            self._credit()
 
     # -- radio --
     def _deliver(self, packet: bytes, credit_value: int | None = None) -> None:
@@ -87,6 +114,7 @@ class FakeDotiiFirmware:
             self.reset_channel()
             if kind == PKT_BENCH_RESET:
                 self.bench_bytes = 0
+            self.set_credit_window(payload[0] if payload else 0)
             self._credit()
             return
         if kind not in (PKT_DATA, PKT_BENCH):
@@ -108,6 +136,11 @@ class FakeDotiiFirmware:
         self.packets_since_credit += 1
         if self.packets_since_credit >= self.credit_every or frames:
             self._credit()
+        if self.flush_handle is not None:
+            self.flush_handle.cancel()
+            self.flush_handle = None
+        if self.packets_since_credit and self.flush_ms is not None:
+            self.flush_handle = asyncio.get_running_loop().call_later(self.flush_ms / 1000, self._flush)
         for request in frames:
             # Firmware drops compressed / >512 B frames before JSON parse when unauthenticated.
             raw = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
@@ -191,8 +224,12 @@ class FakeDotiiFirmware:
         return reply
 
     def status(self) -> bytes:
-        return json.dumps({"v": 1, "name": "Dotii", "firmware": "1.3-test", "provisioned": True,
-                           "wifi": False, "bridge": "x", "sync": 1}).encode()
+        self.status_reads += 1
+        status = {"v": 1, "name": "Dotii", "firmware": "1.3-test", "provisioned": True,
+                  "wifi": False, "bridge": "x", "sync": 1}
+        if not self.legacy_status:
+            status["ble_ready"] = self.status_reads > self.ready_after_reads
+        return json.dumps(status).encode()
 
 
 class FakeBleakClient:
