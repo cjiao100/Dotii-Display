@@ -250,6 +250,9 @@ def load_or_create_token(path: Path) -> str:
     return token
 
 
+LOCAL_HOST_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
 def _is_loopback(address: str) -> bool:
     try:
         return ipaddress.ip_address(address).is_loopback
@@ -1074,7 +1077,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return secrets.compare_digest(self.headers.get("X-Bridge-Token", ""), self.bridge.token)
 
     def _local_admin(self) -> bool:
-        return _is_loopback(self.client_address[0])
+        return _is_loopback(self.client_address[0]) and self._local_host_and_origin()
+
+    def _local_host_and_origin(self) -> bool:
+        """Block DNS rebinding and cross-site requests to the management interface.
+
+        A loopback peer is not enough: a web page in the user's browser can reach
+        127.0.0.1 through a rebinding hostname (wrong Host) or post cross-site
+        (foreign Origin). Non-browser clients send no Origin, which is allowed.
+        """
+        port = getattr(self.bridge, "server_port", None)
+        allowed_hosts = {f"{name}:{port}" for name in LOCAL_HOST_NAMES}
+        host = str(self.headers.get("Host") or "").strip().lower()
+        if host not in allowed_hosts:
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        return str(origin).strip().lower() in {f"http://{value}" for value in allowed_hosts}
 
     def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
         try:
