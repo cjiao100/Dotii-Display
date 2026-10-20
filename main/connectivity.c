@@ -1445,6 +1445,7 @@ static void process_request(cJSON *request, sync_transport_t transport, uint32_t
             if (ble ? ble_wants_data() : usb_mode_allowed()) publish_transport_snapshot(transport, session);
         }
     } else if (strcmp(op, "heartbeat") == 0) {
+        apply_connection_options(request);
         apply_epoch(request);
         /* Keeps BLE fresh between send-on-change snapshots, but only once this
            session has delivered data and BLE is still the wanted source. */
