@@ -588,5 +588,14 @@
   "本机私有": "Local private install",
   "系统回退": "System fallback",
   "Codex CLI、App Server、账户、额度、用量与任务列表均可正常读取": "Codex CLI, App Server, account, limits, usage and task list are all accessible",
-  "部分只读接口检测失败：{0}": "Some read-only checks failed: {0}"
+  "部分只读接口检测失败：{0}": "Some read-only checks failed: {0}",
+  "仅蓝牙": "Bluetooth only",
+  "优先使用 USB，其次已配置的 Wi-Fi，最后使用蓝牙；USB 或蓝牙同步时暂停自动深睡。": "Prefer USB, then the configured Wi-Fi, then Bluetooth. Automatic deep sleep pauses during USB or Bluetooth sync.",
+  "仅通过蓝牙同步文字数据（不传图片），设备需已绑定此管理中心；同步时暂停自动深睡，仍可熄屏。": "Sync text data over Bluetooth only (no images). Dotii must already be bound to this management center. Automatic deep sleep pauses during sync; the display can still turn off.",
+  "蓝牙已连接，文字数据同步正常（不传图片）。": "Bluetooth connected. Text data is syncing (no images).",
+  "正在通过蓝牙连接 Dotii…": "Connecting to Dotii over Bluetooth…",
+  "Dotii 尚未绑定此管理中心，请先通过 USB 或蓝牙配网完成绑定。": "Dotii is not bound to this management center yet. Bind it with USB or Bluetooth setup first.",
+  "当前蓝牙设备与已绑定设备不同，请选择原设备。": "This Bluetooth device differs from the bound Dotii. Select the original device.",
+  "设备固件尚不支持蓝牙数据同步，请先更新固件。": "Device firmware does not support Bluetooth data sync yet. Update the firmware first.",
+  "Dotii 已重置配对，请在系统设置 > 蓝牙中忽略 Dotii 后重新扫描。": "Dotii has reset pairing. Forget Dotii in System Settings > Bluetooth, then scan again."
 }

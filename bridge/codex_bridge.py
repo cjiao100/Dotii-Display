@@ -1650,6 +1650,7 @@ def main() -> None:
                           bluetooth, firmware, writable_root, application_root(), arguments.codex_command,
                           arguments.parent_pid)
     server.usb.start()
+    bluetooth.attach_sync(server)
     if arguments.parent_pid > 1:
         threading.Thread(
             target=watch_parent,

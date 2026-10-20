@@ -29,7 +29,7 @@
   <key>LSMultipleInstancesProhibited</key>
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>用于发现 Dotii，并向设备安全写入 Wi-Fi 与管理中心连接配置。</string>
+  <string>用于发现 Dotii、向设备安全写入 Wi-Fi 与管理中心连接配置，并在 USB 和 Wi-Fi 不可用时通过蓝牙同步状态数据。</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>用于连接局域网中的 Dotii 与 Bambu Lab 打印机，并向 Dotii 提供管理中心数据。</string>
 </dict>

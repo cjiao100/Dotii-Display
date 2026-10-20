@@ -619,11 +619,11 @@
 
             <article class="dependency-panel connection-panel">
               <div class="dependency-heading"><div><h3><span data-i18n="设备连接">设备连接</span></h3></div><span class="dependency-badge" id="device-connection-badge"><span data-i18n="等待连接">等待连接</span></span></div>
-              <div class="dependency-details"><div><span><span data-i18n="当前数据通道">当前数据通道</span></span><strong id="device-transport">--</strong></div><div><span><span data-i18n="最近同步">最近同步</span></span><strong id="device-sync">--</strong></div><div><span>USB</span><strong id="usb-state">--</strong></div><div><span>Wi-Fi</span><strong id="wifi-state">--</strong></div></div>
+              <div class="dependency-details"><div><span><span data-i18n="当前数据通道">当前数据通道</span></span><strong id="device-transport">--</strong></div><div><span><span data-i18n="最近同步">最近同步</span></span><strong id="device-sync">--</strong></div><div><span>USB</span><strong id="usb-state">--</strong></div><div><span>Wi-Fi</span><strong id="wifi-state">--</strong></div><div><span><span data-i18n="蓝牙">蓝牙</span></span><strong id="ble-state">--</strong></div></div>
               <div class="setting-select-row connection-fields">
                 <div class="setting-select-heading">
                   <span class="time-field-label" id="connection-mode-label"><span data-i18n="连接方式">连接方式</span></span>
-                  <small id="connection-mode-help"><span data-i18n="优先使用 USB，断开后切换至已配置的 Wi-Fi；USB 同步时暂停自动深睡。">优先使用 USB，断开后切换至已配置的 Wi-Fi；USB 同步时暂停自动深睡。</span></small>
+                  <small id="connection-mode-help"><span data-i18n="优先使用 USB，其次已配置的 Wi-Fi，最后使用蓝牙；USB 或蓝牙同步时暂停自动深睡。">优先使用 USB，其次已配置的 Wi-Fi，最后使用蓝牙；USB 或蓝牙同步时暂停自动深睡。</span></small>
                 </div>
                 <div class="ui-select" data-ui-select="connection-mode">
                   <input id="connection-mode" type="hidden" value="auto">
@@ -634,6 +634,7 @@
                     <button type="button" role="option" data-value="auto"><span data-i18n="自动（USB 优先）">自动（USB 优先）</span></button>
                     <button type="button" role="option" data-value="usb"><span data-i18n="仅 USB">仅 USB</span></button>
                     <button type="button" role="option" data-value="wifi"><span data-i18n="仅 Wi-Fi">仅 Wi-Fi</span></button>
+                    <button type="button" role="option" data-value="ble"><span data-i18n="仅蓝牙">仅蓝牙</span></button>
                   </div>
                 </div>
               </div>

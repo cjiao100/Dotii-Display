@@ -1842,9 +1842,10 @@ window.setInterval(refreshOverview, 3000);
 
 function renderConnectionModeDescription(mode) {
   const descriptions = {
-    auto: t("优先使用 USB，断开后切换至已配置的 Wi-Fi；USB 同步时暂停自动深睡。"),
+    auto: t("优先使用 USB，其次已配置的 Wi-Fi，最后使用蓝牙；USB 或蓝牙同步时暂停自动深睡。"),
     usb: t("仅通过 USB 同步，请使用数据线连接；同步时暂停自动深睡，仍可熄屏。"),
     wifi: t("仅通过 Wi-Fi 同步，请让设备与电脑连接同一局域网。"),
+    ble: t("仅通过蓝牙同步文字数据（不传图片），设备需已绑定此管理中心；同步时暂停自动深睡，仍可熄屏。"),
   };
   setText("connection-mode-help", descriptions[mode] || descriptions.auto);
 }
@@ -1852,17 +1853,33 @@ function renderConnectionModeDescription(mode) {
 function renderConnection(overview) {
   const config = overview.connection_settings || {};
   const usb = overview.usb || {};
+  const ble = (overview.bluetooth || {}).sync || {};
+  const mode = config.mode || "auto";
+  const usbMode = mode === "auto" || mode === "usb";
+  const wifiMode = mode === "auto" || mode === "wifi";
+  const bleMode = mode === "auto" || mode === "ble";
   const now = Date.now() / 1000;
   const usbLive = usb.state === "connected" && now - usb.last_sync < 12;
   const wifiLive = now - Number(overview.wifi_last_seen || 0) < 20;
   const wifiDataLive = now - Number(overview.wifi_data_last_seen || 0) < 20;
-  const active = config.mode !== "wifi" && usbLive ? "USB" : config.mode !== "usb" && wifiDataLive ? "Wi-Fi" : "--";
-  setText("device-transport", active);
-  setText("device-sync", active === "--" ? "--" : formatTime(active === "USB" ? usb.last_sync : overview.wifi_data_last_seen));
+  const bleLastSync = Math.max(Number(ble.last_sync || 0), Number(ble.last_heartbeat || 0));
+  const bleLinked = ble.state === "connected";
+  const bleLive = bleLinked && ble.want_data === true && Number(ble.last_sync || 0) > 0 && now - bleLastSync < 12;
+  const active = usbMode && usbLive ? "USB" : wifiMode && wifiDataLive ? "Wi-Fi" : bleMode && bleLive ? "BLE" : "--";
+  setText("device-transport", active === "BLE" ? t("蓝牙") : active);
+  setText("device-sync", active === "--" ? "--" : formatTime(active === "USB" ? usb.last_sync : active === "BLE" ? bleLastSync : overview.wifi_data_last_seen));
   setText("device-connection-badge", active === "--" ? t("等待连接") : t("已连接"));
   byId("device-connection-badge").dataset.state = active !== "--" ? "ready" : usb.state === "connecting" || usb.state === "maintenance" ? "running" : "loading";
   setText("usb-state", usbLive ? t("已连接") : usb.state === "maintenance" ? t("固件维护中") : usb.state === "connecting" ? t("连接中") : t("未连接"));
   setText("wifi-state", wifiLive ? (active === "USB" ? t("可用 · 备用") : t("已连接")) : usb.wifi ? t("已连接路由器") : t("未连接"));
+  setText("ble-state", !bleMode ? t("未启用") : active === "BLE" ? t("已连接") : bleLinked ? t("可用 · 备用") : ble.state === "connecting" ? t("连接中") : t("未连接"));
+  const bleErrors = {
+    not_bound: t("Dotii 尚未绑定此管理中心，请先通过 USB 或蓝牙配网完成绑定。"),
+    binding_mismatch: t("设备已绑定其他管理中心，请在设备设置中重置配网后重试。"),
+    different_device: t("当前蓝牙设备与已绑定设备不同，请选择原设备。"),
+    firmware_update_required: t("设备固件尚不支持蓝牙数据同步，请先更新固件。"),
+    stale_pairing: t("Dotii 已重置配对，请在系统设置 > 蓝牙中忽略 Dotii 后重新扫描。"),
+  };
   const errors = {
     firmware_update_required: t("设备固件尚不支持 USB 通信，请先更新固件。"),
     binding_mismatch: t("设备已绑定其他管理中心，请在设备设置中重置配网后重试。"),
@@ -1877,14 +1894,17 @@ function renderConnection(overview) {
   let connectionStatus;
   if (active === "USB") connectionStatus = t("USB 已连接，数据同步正常。");
   else if (active === "Wi-Fi") connectionStatus = t("Wi-Fi 已连接，数据同步正常。");
-  else if (config.mode !== "wifi" && errors[usb.detail] && usb.detail !== "usb_not_found") connectionStatus = errors[usb.detail];
-  else if (config.mode !== "wifi" && usb.state === "maintenance") connectionStatus = t("USB 正在进行固件维护，等待恢复连接。");
-  else if (config.mode !== "wifi" && usb.state === "connecting") connectionStatus = t("正在连接 USB 设备…");
-  else if (config.mode !== "wifi" && usb.state === "connected") connectionStatus = t("USB 已连接，等待数据同步。");
-  else if (config.mode !== "usb" && wifiLive) connectionStatus = t("Wi-Fi 已连接，等待数据同步。");
-  else if (config.mode !== "usb" && usbLive && usb.wifi) connectionStatus = t("Wi-Fi 已连接路由器，等待连接管理中心。");
+  else if (active === "BLE") connectionStatus = t("蓝牙已连接，文字数据同步正常（不传图片）。");
+  else if (usbMode && errors[usb.detail] && usb.detail !== "usb_not_found") connectionStatus = errors[usb.detail];
+  else if (usbMode && usb.state === "maintenance") connectionStatus = t("USB 正在进行固件维护，等待恢复连接。");
+  else if (usbMode && usb.state === "connecting") connectionStatus = t("正在连接 USB 设备…");
+  else if (usbMode && usb.state === "connected") connectionStatus = t("USB 已连接，等待数据同步。");
+  else if (wifiMode && wifiLive) connectionStatus = t("Wi-Fi 已连接，等待数据同步。");
+  else if (wifiMode && usbLive && usb.wifi) connectionStatus = t("Wi-Fi 已连接路由器，等待连接管理中心。");
+  else if (bleMode && ble.state === "error" && bleErrors[ble.detail]) connectionStatus = bleErrors[ble.detail];
+  else if (bleMode && (ble.state === "connecting" || bleLinked)) connectionStatus = t("正在通过蓝牙连接 Dotii…");
   else connectionStatus = t("设备未连接。");
-  const provisionProgress = config.mode !== "wifi" ? progress[usb.provision_state] : "";
+  const provisionProgress = usbMode ? progress[usb.provision_state] : "";
   setText("device-connection-status", provisionProgress ? `${connectionStatus} ${provisionProgress}` : connectionStatus);
   renderConnectionModeDescription(config.mode || "auto");
   if (config.language) window.DotiiI18n.setLanguage(config.language);

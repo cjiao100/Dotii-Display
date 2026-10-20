@@ -28,7 +28,7 @@ class ConnectionSettings:
             raise ValueError("Invalid connection settings")
         if data["language"] not in ("zh-CN", "en") or data["device_language"] not in ("follow", "zh-CN", "en"):
             raise ValueError("Invalid language")
-        if data["mode"] not in ("auto", "usb", "wifi"):
+        if data["mode"] not in ("auto", "usb", "wifi", "ble"):
             raise ValueError("Invalid connection mode")
         for key in ("device_id", "port"):
             if not isinstance(data[key], str) or len(data[key]) > 128:
