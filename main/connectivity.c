@@ -563,6 +563,7 @@ static void copy_display_config(cJSON *root, codex_snapshot_t *snapshot)
     snapshot->charging_screen_off_timeout_seconds = 60;
     snapshot->charging_sleep_timeout_seconds = 300;
     snapshot->screen_off_page = DISPLAY_SCREEN_OFF_PAGE_NONE;
+    snapshot->screen_style = SCREEN_STYLE_LIST;
     cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
     if (!cJSON_IsObject(display)) return;
 
@@ -574,6 +575,7 @@ static void copy_display_config(cJSON *root, codex_snapshot_t *snapshot)
     cJSON *charging_screen_off_timeout = cJSON_GetObjectItemCaseSensitive(display, "charging_screen_off_timeout_seconds");
     cJSON *charging_sleep_timeout = cJSON_GetObjectItemCaseSensitive(display, "charging_sleep_timeout_seconds");
     cJSON *screen_off_page = cJSON_GetObjectItemCaseSensitive(display, "screen_off_page");
+    cJSON *screen_style = cJSON_GetObjectItemCaseSensitive(display, "screen_style");
     if (cJSON_IsNumber(revision) && revision->valuedouble >= 0) {
         snapshot->display_revision = (uint32_t)revision->valuedouble;
     }
@@ -606,6 +608,15 @@ static void copy_display_config(cJSON *root, codex_snapshot_t *snapshot)
             snapshot->screen_off_page = DISPLAY_SCREEN_OFF_PAGE_CUSTOM;
         } else if (strcmp(screen_off_page->valuestring, "dotii") == 0) {
             snapshot->screen_off_page = DISPLAY_SCREEN_OFF_PAGE_DOTII;
+        }
+    }
+    if (cJSON_IsString(screen_style) && screen_style->valuestring != NULL) {
+        if (strcmp(screen_style->valuestring, "rings") == 0) {
+            snapshot->screen_style = SCREEN_STYLE_RINGS;
+        } else if (strcmp(screen_style->valuestring, "carousel") == 0) {
+            snapshot->screen_style = SCREEN_STYLE_CAROUSEL;
+        } else {
+            snapshot->screen_style = SCREEN_STYLE_LIST;
         }
     }
     if ((snapshot->screen_off_timeout_seconds == 0 && snapshot->sleep_timeout_seconds != 0) ||
@@ -668,6 +679,71 @@ static void copy_bambu_status(cJSON *root, codex_snapshot_t *snapshot)
         snapshot->bambu_camera_available = true;
         snapshot->bambu_camera_revision = (uint32_t)camera_revision->valuedouble;
         snapshot->bambu_camera_size = (uint32_t)camera_size->valuedouble;
+    }
+}
+
+static agent_status_t agent_status_from_string(const char *value)
+{
+    if (value == NULL) return AGENT_STATUS_ERROR;
+    if (strcmp(value, "ok") == 0) return AGENT_STATUS_OK;
+    if (strcmp(value, "pending") == 0) return AGENT_STATUS_PENDING;
+    if (strcmp(value, "not_configured") == 0) return AGENT_STATUS_NOT_CONFIGURED;
+    if (strcmp(value, "unavailable") == 0) return AGENT_STATUS_UNAVAILABLE;
+    if (strcmp(value, "auth_error") == 0) return AGENT_STATUS_AUTH_ERROR;
+    if (strcmp(value, "disabled") == 0) return AGENT_STATUS_DISABLED;
+    return AGENT_STATUS_ERROR;
+}
+
+static void copy_agents(cJSON *root, codex_snapshot_t *snapshot)
+{
+    snapshot->agent_count = 0;
+    cJSON *agents = cJSON_GetObjectItemCaseSensitive(root, "agents");
+    if (!cJSON_IsArray(agents)) return;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, agents) {
+        if (!cJSON_IsObject(item) || snapshot->agent_count >= AGENT_QUOTA_MAX) break;
+        agent_quota_t *agent = &snapshot->agents[snapshot->agent_count];
+        memset(agent, 0, sizeof(*agent));
+        copy_json_string(item, "id", agent->id, sizeof(agent->id));
+        copy_json_string(item, "nm", agent->name, sizeof(agent->name));
+        copy_json_string(item, "pl", agent->plan, sizeof(agent->plan));
+        copy_json_string(item, "msg", agent->message, sizeof(agent->message));
+        cJSON *st = cJSON_GetObjectItemCaseSensitive(item, "st");
+        agent->status = agent_status_from_string(cJSON_IsString(st) ? st->valuestring : NULL);
+        cJSON *up = cJSON_GetObjectItemCaseSensitive(item, "up");
+        if (cJSON_IsNumber(up)) {
+            int value = up->valueint;
+            if (value < 0) value = 0;
+            if (value > 100) value = 100;
+            agent->has_used = true;
+            agent->used_percent = (int16_t)value;
+        } else {
+            agent->has_used = false;
+            agent->used_percent = -1;
+        }
+        cJSON *windows = cJSON_GetObjectItemCaseSensitive(item, "w");
+        if (cJSON_IsArray(windows)) {
+            cJSON *w = NULL;
+            cJSON_ArrayForEach(w, windows) {
+                if (!cJSON_IsObject(w) || agent->window_count >= AGENT_WINDOW_MAX) break;
+                agent_window_t *aw = &agent->windows[agent->window_count];
+                copy_json_string(w, "l", aw->label, sizeof(aw->label));
+                cJSON *u = cJSON_GetObjectItemCaseSensitive(w, "u");
+                if (cJSON_IsNumber(u)) {
+                    double value = u->valuedouble;
+                    if (value < 0) value = 0;
+                    if (value > 100) value = 100;
+                    aw->has_used = true;
+                    aw->used_percent = (float)value;
+                } else {
+                    aw->has_used = false;
+                }
+                cJSON *r = cJSON_GetObjectItemCaseSensitive(w, "r");
+                aw->reset_at = cJSON_IsNumber(r) ? (time_t)r->valuedouble : 0;
+                agent->window_count++;
+            }
+        }
+        snapshot->agent_count++;
     }
 }
 
@@ -771,6 +847,7 @@ static bool parse_snapshot_object(cJSON *root, codex_snapshot_t *snapshot)
     copy_custom_config(root, snapshot);
     copy_bambu_status(root, snapshot);
     copy_dotii_state(root, snapshot);
+    copy_agents(root, snapshot);
     ok = true;
 
 done:

@@ -54,6 +54,46 @@ typedef enum {
     DISPLAY_SCREEN_OFF_PAGE_DOTII,
 } display_screen_off_page_t;
 
+/* Multi-agent quota screen style (mirrors bridge SCREEN_STYLE_OPTIONS). */
+typedef enum {
+    SCREEN_STYLE_LIST = 0,
+    SCREEN_STYLE_RINGS,
+    SCREEN_STYLE_CAROUSEL,
+} screen_style_t;
+
+/* Per-agent quota status (mirrors the bridge "st" strings). */
+typedef enum {
+    AGENT_STATUS_OK = 0,
+    AGENT_STATUS_PENDING,
+    AGENT_STATUS_NOT_CONFIGURED,
+    AGENT_STATUS_UNAVAILABLE,
+    AGENT_STATUS_AUTH_ERROR,
+    AGENT_STATUS_ERROR,
+    AGENT_STATUS_DISABLED,
+} agent_status_t;
+
+#define AGENT_QUOTA_MAX 8
+#define AGENT_WINDOW_MAX 2
+
+typedef struct {
+    char label[20];          /* window label, e.g. "周" / "5H" / "Claude/GPT·周" */
+    bool has_used;
+    float used_percent;      /* 0..100 */
+    time_t reset_at;         /* epoch, 0 = unknown */
+} agent_window_t;
+
+typedef struct {
+    char id[16];
+    char name[20];
+    char plan[20];
+    char message[64];        /* optional short hint for signed-out / unavailable */
+    agent_status_t status;
+    bool has_used;
+    int16_t used_percent;    /* headline used %, -1 when unknown */
+    uint8_t window_count;
+    agent_window_t windows[AGENT_WINDOW_MAX];
+} agent_quota_t;
+
 #define CODEX_TASK_DETAIL_MAX 6
 
 typedef struct {
@@ -99,6 +139,9 @@ typedef struct {
     uint32_t charging_screen_off_timeout_seconds;
     uint32_t charging_sleep_timeout_seconds;
     display_screen_off_page_t screen_off_page;
+    screen_style_t screen_style;
+    uint8_t agent_count;
+    agent_quota_t agents[AGENT_QUOTA_MAX];
     int five_hour_remaining_percent;
     int weekly_remaining_percent;
     uint32_t weekly_tokens;
