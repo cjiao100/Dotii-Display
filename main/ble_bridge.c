@@ -103,6 +103,7 @@ static volatile bool s_tx_subscribed;
 static bool s_rx_seq_valid;
 static uint8_t s_rx_seq_expected;
 static uint32_t s_rx_total;
+static uint8_t s_reset_epoch;
 static unsigned s_packets_since_credit;
 static uint8_t s_tx_seq;
 static dtu_stream_t s_stream;
@@ -303,6 +304,7 @@ static void reset_data_channel(void)
     s_rx_seq_expected = 0;
     s_rx_total = 0;
     s_packets_since_credit = 0;
+    s_reset_epoch++;
 }
 
 static void reset_bench(void)
@@ -325,7 +327,8 @@ static bool notify_now(uint16_t conn_handle, const uint8_t *data, size_t length)
 
 static void send_credit(uint16_t conn_handle)
 {
-    uint8_t packet[8] = {PKT_CREDIT, 0,
+    /* Byte 1 carries the reset epoch so a late CREDIT from before RESET is ignored. */
+    uint8_t packet[8] = {PKT_CREDIT, s_reset_epoch,
                          (uint8_t)s_rx_total, (uint8_t)(s_rx_total >> 8),
                          (uint8_t)(s_rx_total >> 16), (uint8_t)(s_rx_total >> 24),
                          s_rx_seq_expected,
@@ -404,6 +407,11 @@ bool ble_bridge_session_ready(uint32_t session)
 bool ble_bridge_receive(ble_frame_t *frame)
 {
     return s_frames != NULL && xQueueReceive(s_frames, frame, 0) == pdTRUE;
+}
+
+bool ble_bridge_pending(void)
+{
+    return s_frames != NULL && uxQueueMessagesWaiting(s_frames) > 0;
 }
 
 void ble_bridge_frame_free(ble_frame_t *frame)

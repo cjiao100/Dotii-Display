@@ -24,6 +24,7 @@ esp_err_t ble_bridge_clear_bonds(void);
 uint32_t ble_bridge_session(void);
 bool ble_bridge_session_ready(uint32_t session);
 bool ble_bridge_receive(ble_frame_t *frame);
+bool ble_bridge_pending(void);
 void ble_bridge_frame_free(ble_frame_t *frame);
 /* Encode message as a DTU1 frame and notify it on DATA_TX. Must not be called
    from the NimBLE host task. Returns false when the session is gone. */

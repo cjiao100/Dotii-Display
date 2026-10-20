@@ -1112,7 +1112,9 @@ typedef enum {
 
 #define SYNC_FRESH_US 12000000LL
 #define BLE_INFLATED_MAX (96 * 1024)
+#define BLE_UNAUTH_FRAME_MAX 512
 #define BLE_AUTH_CONTEXT "dotii-ble-auth-v1"
+#define BLE_BRIDGE_STACK 8192
 
 static int64_t s_ble_last_sync;
 static int64_t s_wifi_last_data;
@@ -1179,21 +1181,42 @@ static int hex_value(char ch)
     return -1;
 }
 
-/* HMAC-SHA256(bound token, "dotii-ble-auth-v1|<device_id>|<nonce>") so the
-   token itself never crosses the Just Works encrypted link. */
-static bool ble_auth_matches(const char *key, const char *nonce, const char *mac_hex)
+/* HMAC-SHA256(bound token, "dotii-ble-auth-v1|<device_id>|<nonce>").
+   The token never crosses the Just Works link; both peers prove possession. */
+static bool ble_auth_message(const char *nonce, char *message, size_t message_size, size_t *written_out)
 {
-    uint8_t mac[32];
-    if (strlen(mac_hex) != sizeof(mac) * 2) return false;
-    for (size_t index = 0; index < sizeof(mac); index++) {
+    int written = snprintf(message, message_size, "%s|%s|%s", BLE_AUTH_CONTEXT, s_device_id, nonce);
+    if (written <= 0 || (size_t)written >= message_size) return false;
+    *written_out = (size_t)written;
+    return true;
+}
+
+static bool ble_hex_to_mac(const char *mac_hex, uint8_t mac[32])
+{
+    if (strlen(mac_hex) != 64) return false;
+    for (size_t index = 0; index < 32; index++) {
         int high = hex_value(mac_hex[index * 2]);
         int low = hex_value(mac_hex[index * 2 + 1]);
         if (high < 0 || low < 0) return false;
         mac[index] = (uint8_t)((high << 4) | low);
     }
+    return true;
+}
+
+static void ble_mac_to_hex(const uint8_t mac[32], char out[65])
+{
+    for (size_t index = 0; index < 32; index++) {
+        snprintf(out + index * 2, 3, "%02x", mac[index]);
+    }
+}
+
+static bool ble_auth_matches(const char *key, const char *nonce, const char *mac_hex)
+{
+    uint8_t mac[32];
+    if (!ble_hex_to_mac(mac_hex, mac)) return false;
     char message[96];
-    int written = snprintf(message, sizeof(message), "%s|%s|%s", BLE_AUTH_CONTEXT, s_device_id, nonce);
-    if (written <= 0 || (size_t)written >= sizeof(message)) return false;
+    size_t written = 0;
+    if (!ble_auth_message(nonce, message, sizeof(message), &written)) return false;
     if (psa_crypto_init() != PSA_SUCCESS) return false;
     psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_VERIFY_MESSAGE);
@@ -1203,10 +1226,43 @@ static bool ble_auth_matches(const char *key, const char *nonce, const char *mac
     psa_status_t status = psa_import_key(&attributes, (const uint8_t *)key, strlen(key), &key_id);
     psa_reset_key_attributes(&attributes);
     if (status != PSA_SUCCESS) return false;
-    status = psa_mac_verify(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256), (const uint8_t *)message,
-                            (size_t)written, mac, sizeof(mac));
+    status = psa_mac_verify(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256), (const uint8_t *)message, written, mac, sizeof(mac));
     psa_destroy_key(key_id);
     return status == PSA_SUCCESS;
+}
+
+/* Device proof for the Mac-supplied host_nonce (mutual auth). out must hold 65 bytes. */
+static bool ble_auth_sign(const char *key, const char *nonce, char out_hex[65])
+{
+    char message[96];
+    size_t written = 0;
+    if (!ble_auth_message(nonce, message, sizeof(message), &written)) return false;
+    if (psa_crypto_init() != PSA_SUCCESS) return false;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_key_id_t key_id = 0;
+    psa_status_t status = psa_import_key(&attributes, (const uint8_t *)key, strlen(key), &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) return false;
+    uint8_t mac[32];
+    size_t mac_length = 0;
+    status = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256), (const uint8_t *)message, written, mac, sizeof(mac),
+                             &mac_length);
+    psa_destroy_key(key_id);
+    if (status != PSA_SUCCESS || mac_length != sizeof(mac)) return false;
+    ble_mac_to_hex(mac, out_hex);
+    return true;
+}
+
+static bool ble_nonce_ok(const char *nonce)
+{
+    if (nonce == NULL || strlen(nonce) != 32) return false;
+    for (const char *cursor = nonce; *cursor; cursor++) {
+        if (hex_value(*cursor) < 0) return false;
+    }
+    return true;
 }
 
 static void new_ble_challenge(uint32_t session)
@@ -1395,13 +1451,17 @@ static void process_request(cJSON *request, sync_transport_t transport, uint32_t
     const bool ble = transport == TRANSPORT_BLE;
     const char *error = NULL;
     bool restart = false;
+    const bool ble_authed = ble && session != 0 && session == s_ble_auth_session;
     if (!ble) {
         if (strlen(token) < 16 || strlen(token) > 64 || (*bound && !token_equal(token, bound))) {
             error = "binding_mismatch";
         }
-    } else if (strcmp(op, "hello") != 0 && strcmp(op, "auth") != 0 && strcmp(op, "ble_diag") != 0 &&
-               (session == 0 || session != s_ble_auth_session)) {
-        error = "unauthenticated";
+    } else if (!ble_authed) {
+        /* hello/auth always; ble_diag only while unbound (bench before provisioning). */
+        const bool diag_ok = strcmp(op, "ble_diag") == 0 && !*bound;
+        if (strcmp(op, "hello") != 0 && strcmp(op, "auth") != 0 && !diag_ok) {
+            error = "unauthenticated";
+        }
     }
     if (error) {
     } else if (strcmp(op, "hello") == 0) {
@@ -1417,11 +1477,19 @@ static void process_request(cJSON *request, sync_transport_t transport, uint32_t
         }
     } else if (strcmp(op, "auth") == 0) {
         const char *mac = usb_string(request, "mac");
+        const char *host_nonce = usb_string(request, "host_nonce");
+        char device_mac[65];
         if (!ble) error = "unsupported_transport";
         else if (!*bound) error = "not_bound";
         else if (session == 0 || s_ble_nonce_session != session || !s_ble_nonce[0]) error = "no_challenge";
+        else if (!ble_nonce_ok(host_nonce)) error = "invalid_nonce";
         else if (!ble_auth_matches(bound, s_ble_nonce, mac)) error = "binding_mismatch";
-        else s_ble_auth_session = session;
+        else if (!ble_auth_sign(bound, host_nonce, device_mac)) error = "auth_failed";
+        else {
+            s_ble_auth_session = session;
+            cJSON_AddStringToObject(response, "device_mac", device_mac);
+            cJSON_AddStringToObject(response, "auth", "hmac-sha256");
+        }
         /* One attempt per challenge. */
         s_ble_nonce[0] = '\0';
         s_ble_nonce_session = 0;
@@ -1476,20 +1544,28 @@ static void process_request(cJSON *request, sync_transport_t transport, uint32_t
     } else error = "unknown_operation";
     cJSON_AddBoolToObject(response, "ok", error == NULL);
     if (error) cJSON_AddStringToObject(response, "error", error);
-    cJSON_AddStringToObject(response, "transport", ble ? "ble" : "usb");
-    cJSON_AddBoolToObject(response, "want_data", ble ? ble_wants_data() : usb_mode_allowed());
-    cJSON_AddBoolToObject(response, "usb_active", connectivity_usb_active());
-    cJSON_AddBoolToObject(response, "ble_active", connectivity_ble_active());
-    cJSON_AddBoolToObject(response, "wifi", s_wifi_connected);
-    cJSON_AddBoolToObject(response, "wifi_bridge", s_wifi_bridge_online);
-    cJSON_AddStringToObject(response, "ssid", config->wifi_ssid);
-    cJSON_AddStringToObject(response, "language", ui_language_english() ? "en" : "zh-CN");
-    cJSON_AddStringToObject(response, "mode", s_connection_mode);
-    cJSON_AddNumberToObject(response, "uptime", esp_timer_get_time() / 1000000);
-    cJSON_AddNumberToObject(response, "reset_reason", esp_reset_reason());
-    cJSON_AddNumberToObject(response, "free_internal", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    cJSON_AddNumberToObject(response, "custom_revision", s_custom_image_active >= 0 ? s_custom_image_revisions[s_custom_image_active] : 0);
-    cJSON_AddNumberToObject(response, "camera_revision", s_bambu_camera_active >= 0 ? s_bambu_camera_revisions[s_bambu_camera_active] : 0);
+    /* Unauthenticated BLE errors (and failed auth) must not leak device state. */
+    const bool ble_minimal = ble && error != NULL &&
+                             (strcmp(error, "unauthenticated") == 0 || strcmp(op, "auth") == 0 ||
+                              (!ble_authed && strcmp(op, "hello") != 0 && strcmp(op, "ble_diag") != 0));
+    if (!ble_minimal) {
+        cJSON_AddStringToObject(response, "transport", ble ? "ble" : "usb");
+        cJSON_AddBoolToObject(response, "want_data", ble ? ble_wants_data() : usb_mode_allowed());
+        cJSON_AddBoolToObject(response, "usb_active", connectivity_usb_active());
+        cJSON_AddBoolToObject(response, "ble_active", connectivity_ble_active());
+        cJSON_AddBoolToObject(response, "wifi", s_wifi_connected);
+        cJSON_AddBoolToObject(response, "wifi_bridge", s_wifi_bridge_online);
+        cJSON_AddStringToObject(response, "ssid", config->wifi_ssid);
+        cJSON_AddStringToObject(response, "language", ui_language_english() ? "en" : "zh-CN");
+        cJSON_AddStringToObject(response, "mode", s_connection_mode);
+        cJSON_AddNumberToObject(response, "uptime", esp_timer_get_time() / 1000000);
+        cJSON_AddNumberToObject(response, "reset_reason", esp_reset_reason());
+        cJSON_AddNumberToObject(response, "free_internal", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        cJSON_AddNumberToObject(response, "custom_revision",
+                                s_custom_image_active >= 0 ? s_custom_image_revisions[s_custom_image_active] : 0);
+        cJSON_AddNumberToObject(response, "camera_revision",
+                                s_bambu_camera_active >= 0 ? s_bambu_camera_revisions[s_bambu_camera_active] : 0);
+    }
     transport_send(transport, session, response);
     cJSON_Delete(response);
     if (restart) { vTaskDelay(pdMS_TO_TICKS(300)); esp_restart(); }
@@ -1515,6 +1591,20 @@ static void bridge_task(void *argument)
         ble_frame_t frame;
         while (ble_bridge_receive(&frame)) {
             const uint32_t session = frame.session;
+            const bool authed = session != 0 && session == s_ble_auth_session;
+            /* Unauthenticated peers may only send small plaintext hello/auth/diag. */
+            if (!authed && (frame.compressed || frame.length > BLE_UNAUTH_FRAME_MAX)) {
+                ble_bridge_frame_free(&frame);
+                cJSON *reply = cJSON_CreateObject();
+                if (reply != NULL) {
+                    cJSON_AddNumberToObject(reply, "id", 0);
+                    cJSON_AddBoolToObject(reply, "ok", false);
+                    cJSON_AddStringToObject(reply, "error", "unauthenticated");
+                    transport_send(TRANSPORT_BLE, session, reply);
+                    cJSON_Delete(reply);
+                }
+                continue;
+            }
             message = decode_ble_frame(&frame);
             ble_bridge_frame_free(&frame);
             if (message != NULL) {
@@ -1559,11 +1649,15 @@ static void bridge_task(void *argument)
         if (!(bits & REFRESH_REQUESTED_BIT) && esp_timer_get_time() - s_last_wifi_poll < CONFIG_STATE_DISPLAY_POLL_SECONDS * 1000000LL) continue;
         s_last_wifi_poll = esp_timer_get_time();
         if (s_wifi_connected) {
-            if (ble_active) {
-                /* Probe with the short ping first so an unreachable bridge cannot
-                   stall BLE request handling for the 10 s snapshot timeout. */
+            const uint32_t ble_session = ble_bridge_session();
+            const bool ble_link_ready = ble_bridge_session_ready(ble_session);
+            const bool ble_handshaking = ble_link_ready && !ble_active;
+            if (ble_active || ble_handshaking || ble_bridge_pending()) {
+                /* Prefer the short ping (and skip the 10 s snapshot) while a BLE
+                   session is authenticating or has frames waiting, so hello/auth
+                   are not starved by an unreachable management center. */
                 check_wifi_link();
-                if (!s_wifi_bridge_online) continue;
+                if (!s_wifi_bridge_online || ble_handshaking || ble_bridge_pending()) continue;
             }
             bambu_command_t command;
             while (s_bambu_command_queue != NULL && xQueueReceive(s_bambu_command_queue, &command, 0) == pdTRUE) {
@@ -1683,7 +1777,7 @@ void connectivity_start(void)
             sizeof(s_bridge_note));
 
     /* Reserve the polling task before the Wi-Fi driver fragments internal RAM. */
-    BaseType_t task_created = xTaskCreate(bridge_task, "bridge", 6144, NULL, 5, NULL);
+    BaseType_t task_created = xTaskCreate(bridge_task, "bridge", BLE_BRIDGE_STACK, NULL, 5, NULL);
     if (task_created != pdPASS) {
         strlcpy(s_bridge_note, "管理中心任务启动失败", sizeof(s_bridge_note));
         ESP_LOGE(TAG, "Unable to create bridge task");
