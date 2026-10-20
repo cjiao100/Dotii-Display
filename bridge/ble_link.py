@@ -68,6 +68,11 @@ def parse_credit(payload: bytes) -> Credit:
     return Credit(received, payload[4], payload[5])
 
 
+def credit_epoch(packet: bytes) -> int:
+    """RESET epoch carried in CREDIT packet byte 1 (firmware s_reset_epoch)."""
+    return packet[1] if len(packet) > 1 else 0
+
+
 @dataclass
 class CreditWindow:
     window: int
@@ -134,6 +139,7 @@ class BleLink:
         self.seq = 0
         self.error: str | None = None
         self.last_credit: Credit | None = None
+        self.credit_epoch: int | None = None  # locked from first CREDIT after RESET
         self.bytes_sent = 0
         self.packets_sent = 0
         self.naks = 0
@@ -147,6 +153,11 @@ class BleLink:
             return
         kind, seq, payload = data[0], data[1], data[HEADER:]
         if kind == PKT_CREDIT:
+            epoch = seq  # firmware puts s_reset_epoch in the CREDIT header seq byte
+            if self.credit_epoch is None:
+                self.credit_epoch = epoch
+            elif epoch != self.credit_epoch:
+                return  # late CREDIT from before the last RESET
             try:
                 self.last_credit = parse_credit(payload)
             except ValueError:
@@ -174,6 +185,7 @@ class BleLink:
         self.error = None
         self.seq = 0
         self.credits.reset()
+        self.credit_epoch = None  # accept the epoch from the CREDIT that follows RESET
         await self.write(bytes((PKT_BENCH_RESET if bench else PKT_RESET, 0)), True)
 
     async def send_stream(self, stream: bytes, kind: int = PKT_DATA) -> None:

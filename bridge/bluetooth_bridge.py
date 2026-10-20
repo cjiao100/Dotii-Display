@@ -9,6 +9,7 @@ import hmac
 import importlib
 import json
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -618,6 +619,7 @@ SYNC_SAFE_ERRORS = {
     "firmware_update_required", "timeout", "sequence_gap", "credit_timeout",
     "disconnected", "unauthenticated", "snapshot_too_large_for_ble", "invalid_frame",
     "stale_pairing", "not_found", "bluetooth_off", "denied", "unavailable",
+    "device_impersonation", "invalid_nonce", "auth_failed",
 }
 BLE_AUTH_CONTEXT = "dotii-ble-auth-v1"
 
@@ -693,6 +695,7 @@ class BleSyncWorker:
         self.want_data = False
         self.force_snapshot = True
         self.connected = False
+        self.authenticated = False
         self.state: dict[str, Any] = {
             "state": "idle", "detail": "", "device_id": "", "firmware": "", "last_sync": 0,
             "last_heartbeat": 0, "want_data": False, "mtu": 0, "chunk": 0, "last_snapshot_bytes": 0,
@@ -779,24 +782,29 @@ class BleSyncWorker:
         self.wake = asyncio.Event()
         failures = 0
         while not self.stop_event.is_set():
-            wanted, reason = self.desired()
-            if not wanted:
-                self._update(state="idle", detail=reason)
-                await self._sleep(2)
-                continue
-            if not self.bridge.operation_lock.acquire(False):
-                self._update(state="waiting", detail="bluetooth_busy")
-                await self._sleep(1)
-                continue
             try:
-                await self._session()
-                failures = 0
-            except Exception as error:  # bleak raises backend-specific errors
+                wanted, reason = self.desired()
+                if not wanted:
+                    self._update(state="idle", detail=reason)
+                    await self._sleep(2)
+                    continue
+                if not self.bridge.operation_lock.acquire(False):
+                    self._update(state="waiting", detail="bluetooth_busy")
+                    await self._sleep(1)
+                    continue
+                try:
+                    await self._session()
+                    failures = 0
+                except Exception as error:  # bleak raises backend-specific errors
+                    failures += 1
+                    self._update(state="error", detail=self._classify(error))
+                finally:
+                    self.connected = False
+                    self.authenticated = False
+                    self.bridge.operation_lock.release()
+            except Exception as error:  # desired()/policy must not kill the worker thread
                 failures += 1
                 self._update(state="error", detail=self._classify(error))
-            finally:
-                self.connected = False
-                self.bridge.operation_lock.release()
             if not self.stop_event.is_set():
                 delay = SYNC_BACKOFF_SECONDS[min(failures, len(SYNC_BACKOFF_SECONDS)) - 1] if failures else 1
                 await self._sleep(delay)
@@ -817,6 +825,8 @@ class BleSyncWorker:
 
     # -- one connection --
     def _on_event(self, item: dict[str, Any]) -> None:
+        if not self.authenticated:
+            return
         if item.get("event") == "want_data":
             self.want_data = bool(item.get("want_data"))
             self.force_snapshot = self.force_snapshot or self.want_data
@@ -836,6 +846,7 @@ class BleSyncWorker:
         def on_disconnect(_client: Any) -> None:
             loop.call_soon_threadsafe(disconnected.set)
 
+        self.authenticated = False
         self._update(state="connecting", detail="")
         client = client_class(address, disconnected_callback=on_disconnect, timeout=20.0,
                               pair=self.bridge.platform.bluetooth_pair_on_connect)
@@ -880,10 +891,17 @@ class BleSyncWorker:
             raise BleSyncError("not_bound")
         if not re.fullmatch(r"[0-9a-f]{32}", challenge):
             raise BleSyncError("firmware_update_required")
+        host_nonce = secrets.token_hex(16)
         try:
-            reply = await rpc.call("auth", mac=ble_auth_mac(self.server.token, device_id, challenge))
+            reply = await rpc.call("auth", mac=ble_auth_mac(self.server.token, device_id, challenge),
+                                   host_nonce=host_nonce)
         except DeviceError as error:
             raise BleSyncError(str(error) if str(error) in SYNC_SAFE_ERRORS else "binding_mismatch") from error
+        expected = ble_auth_mac(self.server.token, device_id, host_nonce)
+        device_mac = str(reply.get("device_mac") or "")
+        if not hmac.compare_digest(expected, device_mac):
+            raise BleSyncError("device_impersonation")
+        self.authenticated = True
         if not settings["device_id"]:
             self.server.connections.write({"device_id": device_id})
         self.want_data = bool(reply.get("want_data"))
