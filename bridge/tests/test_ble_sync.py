@@ -272,6 +272,91 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(FakeBleakClient.instances[0].is_connected)
         await wait_until(lambda: len(FakeBleakClient.instances) == 2, timeout=6)
 
+    async def test_mutual_auth_rejects_impostor_without_device_mac(self):
+        firmware = FakeDotiiFirmware(token=TOKEN)
+        original = firmware.handle
+
+        def broken_handle(request):
+            reply = original(request)
+            reply.pop("device_mac", None)
+            return reply
+
+        firmware.handle = broken_handle  # type: ignore[method-assign]
+        harness = Harness(self.folder / "impostor", firmware=firmware)
+        await self.start(harness)
+        await wait_until(lambda: harness.worker.status()["state"] == "error")
+        self.assertEqual(harness.worker.status()["detail"], "device_impersonation")
+        self.assertFalse(harness.worker.authenticated)
+        self.assertEqual(firmware.snapshots, [])
+
+    async def test_mutual_auth_rejects_wrong_device_mac(self):
+        firmware = FakeDotiiFirmware(token=TOKEN)
+        original = firmware.handle
+
+        def forged(request):
+            reply = original(request)
+            if "device_mac" in reply:
+                reply["device_mac"] = "00" * 32
+            return reply
+
+        firmware.handle = forged  # type: ignore[method-assign]
+        harness = Harness(self.folder / "forged", firmware=firmware)
+        await self.start(harness)
+        await wait_until(lambda: harness.worker.status()["state"] == "error")
+        self.assertEqual(harness.worker.status()["detail"], "device_impersonation")
+
+    async def test_events_ignored_before_authentication(self):
+        firmware = FakeDotiiFirmware(token=TOKEN)
+        harness = Harness(self.folder / "early-event", firmware=firmware)
+        calls: list[str] = []
+        harness.server.bambu = SimpleNamespace(command=lambda action: calls.append(action))
+        real_attach = firmware.attach
+
+        def attach_and_inject(notify):
+            real_attach(notify)
+            firmware.push_event(event="bambu_command", action="pause")
+
+        firmware.attach = attach_and_inject  # type: ignore[method-assign]
+        await self.start(harness)
+        await wait_until(lambda: harness.worker.status()["state"] == "connected")
+        await asyncio.sleep(0.2)
+        self.assertEqual(calls, [])
+        firmware.push_event(event="bambu_command", action="pause")
+        await wait_until(lambda: calls == ["pause"])
+
+    async def test_unauthenticated_error_reply_is_minimal(self):
+        firmware = FakeDotiiFirmware(token=TOKEN, bound=True)
+        reply = firmware.handle({"id": 7, "op": "snapshot", "snapshot": {}})
+        self.assertEqual(reply, {"id": 7, "ok": False, "error": "unauthenticated"})
+        self.assertNotIn("ssid", reply)
+        self.assertNotIn("free_internal", reply)
+        diag = firmware.handle({"id": 8, "op": "ble_diag"})
+        self.assertEqual(diag["error"], "unauthenticated")
+        self.assertNotIn("ble", diag)
+
+    async def test_ble_diag_allowed_only_when_unbound(self):
+        firmware = FakeDotiiFirmware(token=TOKEN, bound=False)
+        reply = firmware.handle({"id": 1, "op": "ble_diag"})
+        self.assertTrue(reply["ok"])
+        self.assertIn("ble", reply)
+
+    async def test_desired_exception_does_not_kill_worker(self):
+        firmware = FakeDotiiFirmware(token=TOKEN)
+        harness = Harness(self.folder / "flaky", firmware=firmware)
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError("transient")
+            return False, "mode_disabled"
+
+        harness.worker.desired = flaky  # type: ignore[method-assign]
+        with mock.patch.object(bluetooth_bridge, "SYNC_BACKOFF_SECONDS", (0.05, 0.05, 0.05)):
+            await self.start(harness)
+            await wait_until(lambda: calls["n"] >= 3, timeout=5)
+        self.assertEqual(harness.worker.status()["state"], "idle")
+
 
 if __name__ == "__main__":
     unittest.main()

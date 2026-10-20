@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -128,6 +129,25 @@ class LinkTests(unittest.IsolatedAsyncioTestCase):
         await link.drain()
         self.assertEqual(firmware.bench_bytes, 4000)
         self.assertEqual(firmware.requests, [])
+
+
+    async def test_late_credit_from_previous_epoch_is_ignored(self):
+        writes = []
+
+        async def write(packet, response):
+            writes.append(packet)
+
+        link = BleLink(write, chunk=50, window=200)
+        await link.reset()
+        # Firmware would send CREDIT with epoch=1 after RESET; lock onto it.
+        link.on_notify(None, bytes((PKT_CREDIT, 1)) + struct.pack("<I", 0) + bytes((0, 3)))
+        self.assertEqual(link.credit_epoch, 1)
+        link.credits.on_sent(100)
+        # Late CREDIT from epoch 0 must not advance the window.
+        link.on_notify(None, bytes((PKT_CREDIT, 0)) + struct.pack("<I", 100) + bytes((0, 3)))
+        self.assertEqual(link.credits.in_flight, 100)
+        link.on_notify(None, bytes((PKT_CREDIT, 1)) + struct.pack("<I", 100) + bytes((0, 3)))
+        self.assertEqual(link.credits.in_flight, 0)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ class FakeDotiiFirmware:
         self.heartbeats = 0
         self.authenticated = False
         self.challenge = ""
+        self.last_reply: dict[str, Any] | None = None
         self.bench_bytes = 0
         self.used_response_for_data = False
         self.max_in_flight = 0
@@ -60,6 +61,7 @@ class FakeDotiiFirmware:
         self.packets_since_credit = 0
         self.received_bytes = 0
         self.credited = 0
+        self.reset_epoch = getattr(self, "reset_epoch", 0) + 1
 
     # -- radio --
     def _deliver(self, packet: bytes, credit_value: int | None = None) -> None:
@@ -73,7 +75,7 @@ class FakeDotiiFirmware:
         if not self.send_credits:
             return
         total = self.received_total
-        packet = bytes((PKT_CREDIT, 0)) + struct.pack("<I", total) + bytes(((self.expected_seq or 0) & 0xFF, 3))
+        packet = bytes((PKT_CREDIT, self.reset_epoch & 0xFF)) + struct.pack("<I", total) + bytes(((self.expected_seq or 0) & 0xFF, 3))
         if self.credit_delay:
             asyncio.get_running_loop().call_later(self.credit_delay, self._deliver, packet, total)
         else:
@@ -107,6 +109,12 @@ class FakeDotiiFirmware:
         if self.packets_since_credit >= self.credit_every or frames:
             self._credit()
         for request in frames:
+            # Firmware drops compressed / >512 B frames before JSON parse when unauthenticated.
+            raw = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
+            if not self.authenticated and len(raw) > 512:
+                self.requests.append(request)
+                self._send({"id": request.get("id", 0), "ok": False, "error": "unauthenticated"})
+                continue
             self.requests.append(request)
             self._send(self.handle(request))
 
@@ -125,8 +133,12 @@ class FakeDotiiFirmware:
         error = None
         if "token" in request:
             error = "token_over_ble_not_expected"
-        elif op not in ("hello", "auth", "ble_diag") and not self.authenticated:
-            error = "unauthenticated"
+        elif not self.authenticated:
+            diag_ok = op == "ble_diag" and not self.bound
+            if op not in ("hello", "auth") and not diag_ok:
+                error = "unauthenticated"
+        if error:
+            pass
         elif op == "hello":
             self.challenge = secrets.token_hex(16)
             reply.update(product="Dotii", protocol=1, device_id=self.device_id, firmware="1.3-test",
@@ -134,13 +146,21 @@ class FakeDotiiFirmware:
         elif op == "auth":
             message = f"dotii-ble-auth-v1|{self.device_id}|{self.challenge}".encode()
             expected = hmac.new(self.token.encode(), message, hashlib.sha256).hexdigest()
+            host_nonce = str(request.get("host_nonce") or "")
             if not self.bound:
                 error = "not_bound"
             elif not self.challenge:
                 error = "no_challenge"
+            elif len(host_nonce) != 32 or any(c not in "0123456789abcdef" for c in host_nonce):
+                error = "invalid_nonce"
             elif not hmac.compare_digest(expected, str(request.get("mac", ""))):
                 error = "binding_mismatch"
             else:
+                proof = hmac.new(self.token.encode(),
+                                 f"dotii-ble-auth-v1|{self.device_id}|{host_nonce}".encode(),
+                                 hashlib.sha256).hexdigest()
+                reply["device_mac"] = proof
+                reply["auth"] = "hmac-sha256"
                 self.authenticated = True
             self.challenge = ""
         elif op == "ble_diag":
@@ -161,7 +181,13 @@ class FakeDotiiFirmware:
         reply["ok"] = error is None
         if error:
             reply["error"] = error
-        reply.update(transport="ble", want_data=self.want_data, wifi=False, wifi_bridge=False, mode=self.mode)
+        # Minimal reply on unauthenticated / failed auth (mirrors connectivity.c).
+        minimal = error is not None and (error == "unauthenticated" or op == "auth" or
+                                         (not self.authenticated and op not in ("hello", "ble_diag")))
+        if not minimal:
+            reply.update(transport="ble", want_data=self.want_data, wifi=False, wifi_bridge=False,
+                         mode=self.mode, ssid="Studio", uptime=1, free_internal=40000)
+        self.last_reply = dict(reply)
         return reply
 
     def status(self) -> bytes:
