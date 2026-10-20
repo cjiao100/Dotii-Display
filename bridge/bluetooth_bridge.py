@@ -634,6 +634,27 @@ class BleSyncError(OSError):
     """A stable, user-safe sync failure code."""
 
 
+def verify_device_mac(token: str, device_id: str, host_nonce: str, device_mac: Any) -> bool:
+    """Constant-time check of the device's proof for our host_nonce."""
+    if not isinstance(device_mac, str) or not device_mac:
+        return False
+    return hmac.compare_digest(ble_auth_mac(token, device_id, host_nonce), device_mac)
+
+
+async def ble_mutual_auth(rpc: "AsyncDtuClient", token: str, device_id: str, challenge: str) -> dict[str, Any]:
+    """auth with our proof + a fresh host_nonce; require the device's proof back.
+
+    Raises DeviceError for device-side refusals (binding_mismatch, not_bound,
+    ...) and BleSyncError("device_impersonation") when the peer cannot prove
+    it holds the bound token. The token never leaves this process.
+    """
+    host_nonce = secrets.token_hex(16)
+    reply = await rpc.call("auth", mac=ble_auth_mac(token, device_id, challenge), host_nonce=host_nonce)
+    if not verify_device_mac(token, device_id, host_nonce, reply.get("device_mac")):
+        raise BleSyncError("device_impersonation")
+    return reply
+
+
 class AsyncDtuClient:
     """Request/reply over a BleLink on one asyncio loop."""
 
@@ -891,16 +912,10 @@ class BleSyncWorker:
             raise BleSyncError("not_bound")
         if not re.fullmatch(r"[0-9a-f]{32}", challenge):
             raise BleSyncError("firmware_update_required")
-        host_nonce = secrets.token_hex(16)
         try:
-            reply = await rpc.call("auth", mac=ble_auth_mac(self.server.token, device_id, challenge),
-                                   host_nonce=host_nonce)
+            reply = await ble_mutual_auth(rpc, self.server.token, device_id, challenge)
         except DeviceError as error:
             raise BleSyncError(str(error) if str(error) in SYNC_SAFE_ERRORS else "binding_mismatch") from error
-        expected = ble_auth_mac(self.server.token, device_id, host_nonce)
-        device_mac = str(reply.get("device_mac") or "")
-        if not hmac.compare_digest(expected, device_mac):
-            raise BleSyncError("device_impersonation")
         self.authenticated = True
         if not settings["device_id"]:
             self.server.connections.write({"device_id": device_id})
