@@ -628,6 +628,23 @@
                   </div>
                 </div>
               </div>
+              <div class="setting-select-row screen-style-setting">
+                <div class="setting-select-heading">
+                  <span class="time-field-label" id="screen-style-label"><span data-i18n="圆屏额度样式">圆屏额度样式</span></span>
+                  <small><span data-i18n="圆屏上多 Agent 额度的展示样式。">圆屏上多 Agent 额度的展示样式。</span></small>
+                </div>
+                <div class="ui-select" data-ui-select="screen-style">
+                  <input id="screen-style" type="hidden" value="list">
+                  <button class="ui-select-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="screen-style-label screen-style-value">
+                    <span id="screen-style-value"><span data-i18n="列表">列表</span></span><span class="ui-select-chevron" aria-hidden="true"></span>
+                  </button>
+                  <div class="ui-select-menu" role="listbox" aria-labelledby="screen-style-label" hidden>
+                    <button type="button" role="option" data-value="list"><span data-i18n="列表">列表</span></button>
+                    <button type="button" role="option" data-value="rings"><span data-i18n="总览环">总览环</span></button>
+                    <button type="button" role="option" data-value="carousel"><span data-i18n="轮播">轮播</span></button>
+                  </div>
+                </div>
+              </div>
               <div class="display-settings-actions">
                 <button class="primary-button" type="submit"><span data-i18n="保存并同步">保存并同步</span></button>
                 <span id="display-save-state" role="status" aria-live="polite"><span data-i18n="使用默认角度">使用默认角度</span></span>
