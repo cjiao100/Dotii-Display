@@ -228,6 +228,11 @@ class AgentQuotaManager:
                 state.next_due = now + self._interval(provider)
                 if enabled:
                     self._set_failure(state, QuotaError("读取超时", STATUS_ERROR), now)
+            detected = state.detection.available or state.detection.configured
+            if not enabled and not detected and "enabled" not in provider.settings:
+                # Nothing installed or logged in: say so instead of "已关闭".
+                state.entry = empty_entry(provider.id, provider.name, STATUS_UNAVAILABLE, state.detection.detail)
+                continue
             if not enabled:
                 detail = state.detection.detail
                 if (not provider.auto_enable and "enabled" not in provider.settings

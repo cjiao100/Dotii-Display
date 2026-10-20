@@ -377,13 +377,15 @@ class ManagerTests(unittest.TestCase):
         manager.tick()
         self.assertEqual(provider.calls, 2)
 
-    def test_undetected_provider_defaults_off(self):
-        provider = _FakeProvider(Detection(False, False, "missing"))
+    def test_undetected_provider_shows_not_detected_until_user_chooses(self):
+        provider = _FakeProvider(Detection(False, False, "未检测到"))
         manager = self.manager(provider)
         manager.tick()
         entry = self.entry(manager)
-        self.assertEqual(entry["status"], "disabled")
-        self.assertFalse(entry["enabled"])
+        self.assertEqual((entry["status"], entry["enabled"], entry["detail"]), ("unavailable", False, "未检测到"))
+        manager.update_provider("fake", {"enabled": False})
+        manager.tick()
+        self.assertEqual(self.entry(manager)["status"], "disabled")
         self.assertEqual(provider.calls, 0)
 
     def test_signed_out_vs_not_detected(self):
@@ -420,7 +422,8 @@ class ManagerTests(unittest.TestCase):
         provider.detect = mock.Mock(side_effect=OSError("disk"))
         manager = self.manager(provider)
         manager.tick()
-        self.assertEqual(self.entry(manager)["status"], "disabled")
+        self.assertEqual(self.entry(manager)["status"], "unavailable")  # shown as 未检测到, no crash
+        self.assertEqual(provider.calls, 0)
 
     def test_settings_persist_without_secrets_and_reject_unknown_keys(self):
         provider = _FakeProvider()
