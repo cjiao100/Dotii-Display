@@ -63,3 +63,18 @@ class CapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentCapTests(unittest.TestCase):
+    def test_agents_capped_in_count_and_text(self):
+        agents = [{"id": "x" * 30, "nm": "n" * 40, "st": "ok", "up": 10,
+                   "w": [{"l": "周" * 20, "u": 10.0, "r": 1},
+                         {"l": "b", "u": 5.0, "r": 2},
+                         {"l": "c", "u": 1.0, "r": 3}]} for _ in range(20)]
+        capped, size = cap_snapshot_for_ble({"codex": {"task": {}}, "agents": agents})
+        out = capped["agents"]
+        self.assertEqual(len(out), 8)
+        self.assertLessEqual(len(out[0]["id"].encode("utf-8")), 12)
+        self.assertLessEqual(len(out[0]["nm"].encode("utf-8")), 16)
+        self.assertEqual(len(out[0]["w"]), 2)
+        self.assertLessEqual(len(out[0]["w"][0]["l"].encode("utf-8")), 16)

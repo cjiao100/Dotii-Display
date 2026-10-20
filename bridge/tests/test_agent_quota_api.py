@@ -127,7 +127,9 @@ class AgentQuotaApiTests(unittest.TestCase):
         handler.do_POST()
         self.assertEqual(sent["status"], 403)
 
-    def test_firmware_snapshot_schema_does_not_carry_agent_quota(self):
+    def test_firmware_snapshot_schema_does_not_carry_heavy_agent_quota(self):
+        # The board gets a compact agents[] (board_agents), never the full,
+        # web-only agent_quota payload.
         sample = json.loads((BRIDGE / "state.json").read_text(encoding="utf-8"))
         validated = codex_bridge.validate_snapshot(sample)
         self.assertNotIn("agent_quota", validated)
@@ -136,7 +138,9 @@ class AgentQuotaApiTests(unittest.TestCase):
         source = (BRIDGE / "codex_bridge.py").read_text(encoding="utf-8")
         server_class = source.split("class BridgeServer(", 1)[1]
         snapshot_body = server_class.split("    def snapshot(self) -> dict[str, Any]:", 1)[1].split("\ndef main", 1)[0]
-        self.assertNotIn("agent_quota", snapshot_body)
+        # No heavy agent_quota output key; the compact board agents[] is allowed.
+        self.assertNotIn('"agent_quota"', snapshot_body)
+        self.assertIn("board_agents", snapshot_body)
 
     def test_frontend_renders_agent_quota_from_overview(self):
         script = (BRIDGE / "web" / "app.js").read_text(encoding="utf-8")

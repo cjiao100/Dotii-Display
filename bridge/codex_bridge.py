@@ -178,10 +178,16 @@ DISPLAY_DEFAULTS = {
     "charging_screen_off_timeout_seconds": 60,
     "charging_sleep_timeout_seconds": 300,
     "screen_off_page": "none",
+    "screen_style": "list",
 }
 DISPLAY_TIMEOUT_OPTIONS = {0, 10, 30, 60, 180, 300, 600, 1800}
 CODEX_UI_OPTIONS = {"classic", "dual_limit"}
 SCREEN_OFF_PAGE_OPTIONS = {"none", "custom", "dotii"}
+# Multi-agent quota screen style, chosen in the management center.
+SCREEN_STYLE_OPTIONS = {"list", "rings", "carousel"}
+# Compact caps for the board-bound agents[] array (firmware mirrors these).
+AGENT_BOARD_MAX = 8
+AGENT_WINDOW_MAX = 2
 CUSTOM_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 WEB_ROOT = resource_path("web")
 MANAGEMENT_CENTER_EXECUTABLE = (
@@ -686,6 +692,9 @@ def validate_display_config(payload: Any) -> dict[str, Any]:
     screen_off_page = payload.get("screen_off_page", DISPLAY_DEFAULTS["screen_off_page"])
     if screen_off_page not in SCREEN_OFF_PAGE_OPTIONS:
         raise ValueError("display.screen_off_page must be none, custom or dotii")
+    screen_style = payload.get("screen_style", DISPLAY_DEFAULTS["screen_style"])
+    if screen_style not in SCREEN_STYLE_OPTIONS:
+        raise ValueError("display.screen_style must be list, rings or carousel")
     screen_off_timeout, sleep_timeout = _validate_timeout_pair(
         payload, "screen_off_timeout_seconds", "sleep_timeout_seconds",
         DISPLAY_DEFAULTS["screen_off_timeout_seconds"], DISPLAY_DEFAULTS["sleep_timeout_seconds"],
@@ -703,7 +712,58 @@ def validate_display_config(payload: Any) -> dict[str, Any]:
         "charging_screen_off_timeout_seconds": charging_screen_off_timeout,
         "charging_sleep_timeout_seconds": charging_sleep_timeout,
         "screen_off_page": screen_off_page,
+        "screen_style": screen_style,
     }
+
+
+def board_agents(quota_snapshot: Any) -> list[dict[str, Any]]:
+    """Compact, board-bound agents[] built from AgentQuotaManager.snapshot().
+
+    Only enabled (user-tracked or auto) providers are included; these are all
+    non-Codex agents (Codex keeps its own ``codex`` block). Text is byte-capped
+    and the array is bounded so the firmware mirror stays small.
+    """
+    agents: list[dict[str, Any]] = []
+    if not isinstance(quota_snapshot, dict):
+        return agents
+    for entry in quota_snapshot.get("providers", []):
+        if not isinstance(entry, dict) or not entry.get("enabled"):
+            continue
+        status = str(entry.get("status") or "")
+        item: dict[str, Any] = {
+            "id": _bounded_text(str(entry.get("id") or ""), 12, "agent.id"),
+            "nm": _bounded_text(str(entry.get("name") or ""), 16, "agent.nm"),
+            "st": status,
+        }
+        plan = entry.get("plan")
+        if plan:
+            item["pl"] = _bounded_text(str(plan), 16, "agent.pl")
+        used = entry.get("used_percent")
+        if isinstance(used, (int, float)) and not isinstance(used, bool):
+            item["up"] = max(0, min(100, int(round(used))))
+        raw_windows = [w for w in (entry.get("windows") or []) if isinstance(w, dict)]
+        # Most-constraining window first; keep at most AGENT_WINDOW_MAX.
+        raw_windows.sort(
+            key=lambda w: (w.get("used_percent") is None, -(w.get("used_percent") or 0.0))
+        )
+        windows = []
+        for w in raw_windows[:AGENT_WINDOW_MAX]:
+            wu = w.get("used_percent")
+            windows.append({
+                "l": _bounded_text(str(w.get("label") or ""), 16, "agent.w.l"),
+                "u": None if wu is None else round(float(wu), 1),
+                "r": int(w.get("reset_at_epoch") or 0),
+            })
+        if windows:
+            item["w"] = windows
+        if status != "ok":
+            message = entry.get("detail") or entry.get("error") or ""
+            if message:
+                item["msg"] = _bounded_text(str(message), 60, "agent.msg")
+        agents.append(item)
+        if len(agents) >= AGENT_BOARD_MAX:
+            break
+    return agents
 
 
 def validate_snapshot(payload: Any) -> dict[str, Any]:
@@ -1649,6 +1709,9 @@ class BridgeServer(ThreadingHTTPServer):
             snapshot, snapshot["bambu"], modules["dotii"], self.dotii.read()
         )
         snapshot["display"] = {**self.display.read(), **self.connections.device()}
+        if self.agent_quota is not None:
+            # Board-bound, compact; Codex stays in the ``codex`` block above.
+            snapshot["agents"] = board_agents(self.agent_quota.snapshot())
         return snapshot
 
 
