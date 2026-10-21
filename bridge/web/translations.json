@@ -672,5 +672,8 @@
   "圆屏上多 Agent 额度的展示样式。": "How multiple agent quotas are shown on the circular screen.",
   "列表": "List",
   "总览环": "Overview rings",
-  "轮播": "Carousel"
+  "轮播": "Carousel",
+  "列表样式预览": "List style preview",
+  "总览环样式预览": "Overview rings style preview",
+  "轮播样式预览": "Carousel style preview"
 }
