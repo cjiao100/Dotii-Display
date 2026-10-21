@@ -27,6 +27,8 @@ TEXT_CAPS = {
 MESSAGE_CAP = 900
 MESSAGE_COUNT = 6
 MAX_TASKS = 6                       # CODEX_TASK_DETAIL_MAX
+MAX_AGENTS = 8                      # AGENT_BOARD_MAX (firmware agents[] mirror)
+MAX_AGENT_WINDOWS = 2              # AGENT_WINDOW_MAX
 COMPRESSED_BUDGET = 12 * 1024       # whole DTZ1 request on the wire
 RAW_BUDGET = 64 * 1024              # well under the firmware 96 KB inflate cap
 SCALES = (1.0, 0.5, 0.25, 0.1)
@@ -80,7 +82,28 @@ def _shape(snapshot: dict[str, Any], scale: float, drop_history: bool) -> dict[s
                 for item in codex["tasks"]:
                     if isinstance(item, dict):
                         item["codex_messages"] = item.get("codex_messages", [])[-1:]
+    agents = capped.get("agents")
+    if isinstance(agents, list):
+        capped["agents"] = [_cap_agent(item) for item in agents[:MAX_AGENTS]]
     return capped
+
+
+def _cap_agent(agent: Any) -> Any:
+    """Bound a single board agent entry (already small; this is a safety net)."""
+    if not isinstance(agent, dict):
+        return agent
+    for key, limit in (("id", 12), ("nm", 16), ("pl", 16), ("msg", 60)):
+        if isinstance(agent.get(key), str):
+            agent[key] = truncate_utf8(agent[key], limit)
+    windows = agent.get("w")
+    if isinstance(windows, list):
+        trimmed = []
+        for w in windows[:MAX_AGENT_WINDOWS]:
+            if isinstance(w, dict) and isinstance(w.get("l"), str):
+                w["l"] = truncate_utf8(w["l"], 16)
+            trimmed.append(w)
+        agent["w"] = trimmed
+    return agent
 
 
 def cap_snapshot_for_ble(snapshot: dict[str, Any], envelope: dict[str, Any] | None = None,

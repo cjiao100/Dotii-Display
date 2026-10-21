@@ -667,5 +667,13 @@
   "未找到 qodercli": "qodercli not found",
   "agy /usage 超时": "agy /usage timed out",
   "Qoder get_usage_info 超时": "Qoder get_usage_info timed out",
-  "qodercli 提前退出": "qodercli exited early"
+  "qodercli 提前退出": "qodercli exited early",
+  "圆屏额度样式": "Circular quota layout",
+  "圆屏上多 Agent 额度的展示样式。": "How multiple agent quotas are shown on the circular screen.",
+  "列表": "List",
+  "总览环": "Overview rings",
+  "轮播": "Carousel",
+  "列表样式预览": "List style preview",
+  "总览环样式预览": "Overview rings style preview",
+  "轮播样式预览": "Carousel style preview"
 }

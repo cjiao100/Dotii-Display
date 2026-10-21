@@ -42,7 +42,8 @@ LV_FONT_DECLARE(ui_font_fixed_20);
 #define COLOR_BAMBU 0x00AE42
 #define COLOR_WARNING 0xF2C66D
 #define COLOR_DANGER 0xFF766F
-#define PAGE_COUNT 4
+#define COLOR_AGENTS 0xB68BFF
+#define PAGE_COUNT 5
 #define TITLE_HEIGHT 30
 #define DISPLAY_ANGLE_DEFAULT_TENTHS 840
 #define DISPLAY_ANGLE_MIN_TENTHS 800
@@ -69,6 +70,13 @@ static lv_obj_t *s_bambu_main;
 static lv_obj_t *s_bambu_detail;
 static lv_obj_t *s_custom;
 static lv_obj_t *s_dotii;
+static lv_obj_t *s_agents;
+static lv_obj_t *s_agents_content;
+static lv_obj_t *s_agents_list;
+static uint8_t s_agents_carousel_index;
+static uint8_t s_agents_detail_index;
+static bool s_agents_rings_detail;
+static uint32_t s_agents_signature;
 static lv_obj_t *s_control;
 static lv_obj_t *s_settings;
 static lv_obj_t *s_power;
@@ -188,7 +196,7 @@ typedef struct {
     lv_obj_t *target;
 } page_scroll_pair_t;
 
-static page_scroll_pair_t s_page_scroll_pairs[2];
+static page_scroll_pair_t s_page_scroll_pairs[3];
 static size_t s_page_scroll_pair_count;
 
 static bool screen_enabled(lv_obj_t *screen);
@@ -198,6 +206,9 @@ static lv_obj_t *first_enabled_screen(void);
 static lv_obj_t *enabled_return_screen(lv_obj_t *screen);
 static void render_codex_detail(void);
 static void render_dotii_expression(void);
+static void build_agents(void);
+static void render_agents(bool force);
+static void agents_gesture_horizontal(bool next);
 static lv_color_t color(uint32_t hex);
 static void set_screen_background(lv_obj_t *screen);
 static void screen_off(void);
@@ -455,6 +466,10 @@ static void swipe_event(lv_event_t *event)
         } else {
             return_from_current();
         }
+    } else if (s_current == s_agents && direction == LV_DIR_LEFT) {
+        agents_gesture_horizontal(true);
+    } else if (s_current == s_agents && direction == LV_DIR_RIGHT) {
+        agents_gesture_horizontal(false);
     } else if (s_current == s_bambu_main && direction == LV_DIR_LEFT) {
         load_screen(s_bambu_detail, true);
     } else if (direction == LV_DIR_RIGHT) {
@@ -778,7 +793,8 @@ static bool page_enabled(uint8_t page)
     if (page == 0) return s_snapshot.codex_enabled;
     if (page == 1) return s_snapshot.bambu_enabled;
     if (page == 2) return s_snapshot.custom_enabled;
-    return s_snapshot.dotii_enabled;
+    if (page == 3) return s_snapshot.dotii_enabled;
+    return s_snapshot.agent_count > 0;
 }
 
 static lv_obj_t *page_screen(uint8_t page)
@@ -786,7 +802,8 @@ static lv_obj_t *page_screen(uint8_t page)
     if (page == 0) return s_snapshot.codex_ui_dual_limit ? s_plus_main : s_main;
     if (page == 1) return s_bambu_main;
     if (page == 2) return s_custom;
-    return s_dotii;
+    if (page == 3) return s_dotii;
+    return s_agents;
 }
 
 static lv_obj_t *first_enabled_screen(void)
@@ -803,6 +820,7 @@ static bool screen_enabled(lv_obj_t *screen)
     if (screen == s_bambu_main || screen == s_bambu_detail) return page_enabled(1);
     if (screen == s_custom) return page_enabled(2);
     if (screen == s_dotii) return page_enabled(3);
+    if (screen == s_agents) return page_enabled(4);
     return true;
 }
 
@@ -814,7 +832,7 @@ static lv_obj_t *enabled_return_screen(lv_obj_t *screen)
 
 static void update_page_dots(void)
 {
-    static const uint32_t active_colors[PAGE_COUNT] = {COLOR_BLUE, COLOR_BAMBU, COLOR_WARNING, COLOR_CYAN};
+    static const uint32_t active_colors[PAGE_COUNT] = {COLOR_BLUE, COLOR_BAMBU, COLOR_WARNING, COLOR_CYAN, COLOR_AGENTS};
     for (uint8_t row = 0; row < PAGE_COUNT; ++row) {
         int total_width = 0;
         uint8_t count = 0;
@@ -1901,6 +1919,368 @@ static lv_obj_t *make_quick_button(lv_obj_t *parent,
     return button;
 }
 
+/* ===== Multi-agent quota screens (list / rings / carousel) ===== */
+
+static uint32_t agent_sev_color(int used)
+{
+    if (used < 0) return COLOR_MUTED;
+    if (used > 90) return COLOR_DANGER;
+    if (used >= 70) return COLOR_WARNING;
+    return COLOR_GREEN;
+}
+
+static uint32_t agent_accent(const agent_quota_t *a)
+{
+    if (strcmp(a->id, "grok") == 0) return COLOR_BLUE;
+    if (strcmp(a->id, "antigravity") == 0) return COLOR_ORANGE;
+    if (strcmp(a->id, "kimi") == 0) return COLOR_CYAN;
+    if (strcmp(a->id, "zcode") == 0) return COLOR_GREEN;
+    if (strcmp(a->id, "qoder") == 0) return COLOR_WARNING;
+    return COLOR_AGENTS;
+}
+
+static const char *agent_status_text(agent_status_t st)
+{
+    switch (st) {
+        case AGENT_STATUS_AUTH_ERROR: return ui_tr("令牌过期");
+        case AGENT_STATUS_UNAVAILABLE: return ui_tr("未检测到");
+        case AGENT_STATUS_PENDING: return ui_tr("读取中");
+        case AGENT_STATUS_ERROR: return ui_tr("读取失败");
+        default: return ui_tr("未登录");
+    }
+}
+
+static uint32_t agent_status_tint(agent_status_t st)
+{
+    switch (st) {
+        case AGENT_STATUS_AUTH_ERROR: return COLOR_WARNING;
+        case AGENT_STATUS_ERROR: return COLOR_DANGER;
+        case AGENT_STATUS_PENDING: return COLOR_BLUE;
+        default: return COLOR_MUTED;
+    }
+}
+
+static bool agent_has_quota(const agent_quota_t *a)
+{
+    return a->status == AGENT_STATUS_OK && a->has_used && a->used_percent >= 0;
+}
+
+static lv_obj_t *agents_fill_rect(lv_obj_t *parent, int x, int y, int w, int h,
+                                  int r, uint32_t c)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_style_radius(o, r, 0);
+    lv_obj_set_style_bg_color(o, color(c), 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    return o;
+}
+
+static lv_obj_t *agents_ring(lv_obj_t *parent, int cx, int cy, int radius,
+                             int width, int used, uint32_t c)
+{
+    lv_obj_t *arc = lv_arc_create(parent);
+    lv_obj_set_size(arc, radius * 2, radius * 2);
+    lv_obj_set_pos(arc, cx - radius, cy - radius);
+    lv_arc_set_range(arc, 0, 100);
+    lv_arc_set_bg_angles(arc, 135, 45);
+    lv_arc_set_value(arc, used < 0 ? 0 : (used > 100 ? 100 : used));
+    lv_obj_set_style_arc_width(arc, width, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, color(0x232928), LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, width, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, color(c), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    if (used < 0) lv_obj_set_style_arc_opa(arc, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    return arc;
+}
+
+static lv_obj_t *agents_center_label(lv_obj_t *parent, const char *txt,
+                                     const lv_font_t *f, uint32_t c,
+                                     int cx, int y, int w)
+{
+    lv_obj_t *l = make_label(parent, txt, f, c);
+    lv_obj_set_width(l, w);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(l, cx - w / 2, y);
+    return l;
+}
+
+static void agents_list_row(lv_obj_t *parent, const agent_quota_t *a, int y)
+{
+    lv_obj_t *card = agents_fill_rect(parent, (SCREEN_SIZE - 320) / 2, y, 320, 84,
+                                      20, COLOR_SURFACE);
+    agents_fill_rect(card, 12, 14, 6, 56, 3, agent_accent(a));
+    lv_obj_t *name = make_label(card, a->name, &lv_font_montserrat_22, COLOR_TEXT);
+    lv_obj_set_pos(name, 30, 12);
+
+    if (agent_has_quota(a)) {
+        char pct[12];
+        snprintf(pct, sizeof(pct), "%d%%", a->used_percent);
+        lv_obj_t *p = make_label(card, pct, &lv_font_montserrat_28,
+                                 agent_sev_color(a->used_percent));
+        lv_obj_align(p, LV_ALIGN_TOP_RIGHT, -16, 10);
+        const char *wl = (a->window_count > 0 && a->windows[0].label[0]) ?
+            a->windows[0].label : ui_tr("已用");
+        lv_obj_t *lbl = make_label(card, wl, &ui_font_detail_20, COLOR_MUTED);
+        lv_obj_set_pos(lbl, 30, 46);
+        agents_fill_rect(card, 30, 74, 230, 8, 4, 0x232928);
+        int fw = 230 * a->used_percent / 100;
+        if (fw < 3 && a->used_percent > 0) fw = 3;
+        if (fw > 0) agents_fill_rect(card, 30, 74, fw, 8, 4,
+                                     agent_sev_color(a->used_percent));
+    } else {
+        lv_obj_t *st = make_label(card, agent_status_text(a->status),
+                                  &ui_font_detail_20, agent_status_tint(a->status));
+        lv_obj_align(st, LV_ALIGN_RIGHT_MID, -18, 0);
+        if (a->message[0]) {
+            lv_obj_t *msg = make_label(card, a->message, &ui_font_detail_20,
+                                       COLOR_MUTED);
+            lv_obj_set_width(msg, 236);
+            lv_label_set_long_mode(msg, LV_LABEL_LONG_DOT);
+            lv_obj_set_pos(msg, 30, 48);
+        }
+    }
+}
+
+static void render_agents_list(void)
+{
+    lv_obj_remove_flag(s_agents_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_agents_content, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clean(s_agents_list);
+    lv_obj_scroll_to_y(s_agents_list, 0, LV_ANIM_OFF);
+
+    agents_center_label(s_agents_list, ui_tr("Agent 额度"), &s_ui_font,
+                        COLOR_MUTED, SCREEN_SIZE / 2, 40, SCREEN_SIZE);
+
+    int y = 80;
+    for (uint8_t i = 0; i < s_snapshot.agent_count; ++i) {
+        agents_list_row(s_agents_list, &s_snapshot.agents[i], y);
+        y += 96;
+    }
+    /* Bottom spacer so the last card can scroll above the round bezel. */
+    lv_obj_t *sp = lv_obj_create(s_agents_list);
+    lv_obj_remove_style_all(sp);
+    lv_obj_set_size(sp, 4, 70);
+    lv_obj_set_pos(sp, 0, y);
+}
+
+static void render_agents_rings(void)
+{
+    lv_obj_remove_flag(s_agents_content, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_agents_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clean(s_agents_content);
+
+    if (!s_agents_rings_detail) {
+        static const int cx[6] = {150, 316, 150, 316, 150, 316};
+        static const int cy[6] = {158, 158, 262, 262, 366, 366};
+        agents_center_label(s_agents_content, ui_tr("Agent 额度"), &s_ui_font,
+                            COLOR_MUTED, SCREEN_SIZE / 2, 24, SCREEN_SIZE);
+        uint8_t shown = s_snapshot.agent_count > 6 ? 6 : s_snapshot.agent_count;
+        for (uint8_t i = 0; i < shown; ++i) {
+            const agent_quota_t *a = &s_snapshot.agents[i];
+            bool q = agent_has_quota(a);
+            agents_ring(s_agents_content, cx[i], cy[i], 46, 9,
+                        q ? a->used_percent : -1,
+                        q ? agent_sev_color(a->used_percent) : COLOR_MUTED);
+            if (q) {
+                char pct[12];
+                snprintf(pct, sizeof(pct), "%d", a->used_percent);
+                agents_center_label(s_agents_content, pct, &lv_font_montserrat_22,
+                                    COLOR_TEXT, cx[i], cy[i] - 14, 70);
+            } else {
+                agents_center_label(s_agents_content, "--", &lv_font_montserrat_18,
+                                    COLOR_MUTED, cx[i], cy[i] - 12, 70);
+            }
+            agents_center_label(s_agents_content, a->name, &lv_font_montserrat_16,
+                                COLOR_MUTED, cx[i], cy[i] + 30, 120);
+        }
+        return;
+    }
+
+    /* Detail view: one agent with concentric window rings. */
+    if (s_agents_detail_index >= s_snapshot.agent_count) s_agents_detail_index = 0;
+    const agent_quota_t *a = &s_snapshot.agents[s_agents_detail_index];
+    agents_center_label(s_agents_content, a->name, &lv_font_montserrat_28,
+                        COLOR_TEXT, SCREEN_SIZE / 2, 40, SCREEN_SIZE);
+    if (agent_has_quota(a)) {
+        int u0 = a->window_count > 0 ? (int)a->windows[0].used_percent : a->used_percent;
+        agents_ring(s_agents_content, 233, 238, 158, 22, u0, agent_sev_color(u0));
+        if (a->window_count > 1) {
+            int u1 = (int)a->windows[1].used_percent;
+            agents_ring(s_agents_content, 233, 238, 120, 18, u1,
+                        agent_sev_color(u1));
+        }
+        char pct[12];
+        snprintf(pct, sizeof(pct), "%d%%", a->used_percent);
+        agents_center_label(s_agents_content, pct, &lv_font_montserrat_32,
+                            COLOR_TEXT, 233, 214, 160);
+        const char *wl = (a->window_count > 0 && a->windows[0].label[0]) ?
+            a->windows[0].label : ui_tr("已用");
+        agents_center_label(s_agents_content, wl, &ui_font_detail_20,
+                            COLOR_MUTED, 233, 252, 200);
+    } else {
+        agents_center_label(s_agents_content, agent_status_text(a->status),
+                            &ui_font_detail_20, agent_status_tint(a->status),
+                            233, 230, 300);
+    }
+    char idx[16];
+    snprintf(idx, sizeof(idx), "%d / %d", s_agents_detail_index + 1,
+             s_snapshot.agent_count);
+    agents_center_label(s_agents_content, idx, &lv_font_montserrat_18,
+                        COLOR_MUTED, SCREEN_SIZE / 2, 408, SCREEN_SIZE);
+}
+
+static void render_agents_carousel(void)
+{
+    lv_obj_remove_flag(s_agents_content, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_agents_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clean(s_agents_content);
+
+    if (s_agents_carousel_index >= s_snapshot.agent_count) s_agents_carousel_index = 0;
+    const agent_quota_t *a = &s_snapshot.agents[s_agents_carousel_index];
+    agents_center_label(s_agents_content, a->name, &lv_font_montserrat_28,
+                        COLOR_TEXT, SCREEN_SIZE / 2, 54, SCREEN_SIZE);
+
+    if (agent_has_quota(a)) {
+        agents_ring(s_agents_content, 233, 214, 150, 24, a->used_percent,
+                    agent_sev_color(a->used_percent));
+        char big[8];
+        snprintf(big, sizeof(big), "%d", a->used_percent);
+        agents_center_label(s_agents_content, big, &ui_font_digits_64,
+                            COLOR_TEXT, 233, 176, 200);
+        const char *wl = (a->window_count > 0 && a->windows[0].label[0]) ?
+            a->windows[0].label : ui_tr("已用");
+        agents_center_label(s_agents_content, wl, &ui_font_detail_20,
+                            COLOR_MUTED, 233, 262, 220);
+        if (a->window_count > 1 && a->windows[1].label[0]) {
+            char line[48];
+            snprintf(line, sizeof(line), "%s %.0f%%", a->windows[1].label,
+                     a->windows[1].used_percent);
+            agents_center_label(s_agents_content, line, &ui_font_detail_20,
+                                COLOR_MUTED, 233, 356, 300);
+        }
+    } else {
+        agents_ring(s_agents_content, 233, 214, 150, 24, -1, COLOR_MUTED);
+        agents_center_label(s_agents_content, agent_status_text(a->status),
+                            &ui_font_detail_20, agent_status_tint(a->status),
+                            233, 200, 240);
+        if (a->message[0]) {
+            agents_center_label(s_agents_content, a->message, &ui_font_detail_20,
+                                COLOR_MUTED, 233, 356, 320);
+        }
+    }
+    char idx[16];
+    snprintf(idx, sizeof(idx), "%d / %d", s_agents_carousel_index + 1,
+             s_snapshot.agent_count);
+    agents_center_label(s_agents_content, idx, &lv_font_montserrat_18,
+                        COLOR_MUTED, SCREEN_SIZE / 2, 408, SCREEN_SIZE);
+}
+
+static uint32_t agents_signature(void)
+{
+    uint32_t sig = 2166136261u;
+    sig = (sig ^ (uint32_t)s_snapshot.screen_style) * 16777619u;
+    sig = (sig ^ s_snapshot.agent_count) * 16777619u;
+    sig = (sig ^ s_agents_carousel_index) * 16777619u;
+    sig = (sig ^ s_agents_detail_index) * 16777619u;
+    sig = (sig ^ (s_agents_rings_detail ? 1u : 0u)) * 16777619u;
+    for (uint8_t i = 0; i < s_snapshot.agent_count; ++i) {
+        const agent_quota_t *a = &s_snapshot.agents[i];
+        sig = (sig ^ (uint32_t)a->status) * 16777619u;
+        sig = (sig ^ (uint32_t)(a->used_percent & 0xFFFF)) * 16777619u;
+        sig = (sig ^ (uint32_t)a->window_count) * 16777619u;
+        for (uint8_t w = 0; w < a->window_count && w < AGENT_WINDOW_MAX; ++w) {
+            sig = (sig ^ (uint32_t)(int)(a->windows[w].used_percent * 10)) * 16777619u;
+        }
+    }
+    return sig;
+}
+
+static void render_agents(bool force)
+{
+    if (s_agents_content == NULL) return;
+    if (s_agents_carousel_index >= s_snapshot.agent_count) s_agents_carousel_index = 0;
+    if (s_agents_detail_index >= s_snapshot.agent_count) s_agents_detail_index = 0;
+    if (s_snapshot.agent_count == 0) s_agents_rings_detail = false;
+
+    uint32_t sig = agents_signature();
+    if (!force && sig == s_agents_signature) return;
+    s_agents_signature = sig;
+
+    switch (s_snapshot.screen_style) {
+        case SCREEN_STYLE_RINGS: render_agents_rings(); break;
+        case SCREEN_STYLE_CAROUSEL: render_agents_carousel(); break;
+        default: render_agents_list(); break;
+    }
+}
+
+static void agents_gesture_horizontal(bool next)
+{
+    if (s_snapshot.agent_count == 0) return;
+    if (s_snapshot.screen_style == SCREEN_STYLE_CAROUSEL) {
+        if (next && s_agents_carousel_index + 1 < s_snapshot.agent_count) {
+            s_agents_carousel_index++;
+            bsp_display_transform_set_next_sweep(BSP_DISPLAY_SWEEP_LEFT);
+        } else if (!next && s_agents_carousel_index > 0) {
+            s_agents_carousel_index--;
+            bsp_display_transform_set_next_sweep(BSP_DISPLAY_SWEEP_RIGHT);
+        } else {
+            return;
+        }
+        render_agents(true);
+    } else if (s_snapshot.screen_style == SCREEN_STYLE_RINGS) {
+        if (!s_agents_rings_detail) {
+            if (!next) return;
+            s_agents_rings_detail = true;
+            s_agents_detail_index = 0;
+            bsp_display_transform_set_next_sweep(BSP_DISPLAY_SWEEP_LEFT);
+        } else if (next && s_agents_detail_index + 1 < s_snapshot.agent_count) {
+            s_agents_detail_index++;
+            bsp_display_transform_set_next_sweep(BSP_DISPLAY_SWEEP_LEFT);
+        } else if (!next && s_agents_detail_index > 0) {
+            s_agents_detail_index--;
+            bsp_display_transform_set_next_sweep(BSP_DISPLAY_SWEEP_RIGHT);
+        } else if (!next) {
+            s_agents_rings_detail = false;
+            bsp_display_transform_set_next_sweep(BSP_DISPLAY_SWEEP_RIGHT);
+        } else {
+            return;
+        }
+        render_agents(true);
+    }
+}
+
+static void build_agents(void)
+{
+    s_agents = lv_obj_create(NULL);
+    set_screen_background(s_agents);
+    add_activity_event(s_agents);
+    lv_obj_add_event_cb(s_agents, swipe_event, LV_EVENT_GESTURE, NULL);
+
+    s_agents_content = lv_obj_create(s_agents);
+    lv_obj_remove_style_all(s_agents_content);
+    lv_obj_set_size(s_agents_content, SCREEN_SIZE, SCREEN_SIZE);
+    lv_obj_set_pos(s_agents_content, 0, 0);
+    lv_obj_remove_flag(s_agents_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_agents_list = lv_obj_create(s_agents);
+    lv_obj_remove_style_all(s_agents_list);
+    lv_obj_set_size(s_agents_list, SCREEN_SIZE, SCREEN_SIZE);
+    lv_obj_set_pos(s_agents_list, 0, 0);
+    register_page_scroll_target(s_agents, s_agents_list);
+
+    make_page_dots(s_agents, 4);
+    render_agents(true);
+}
+
+
 static void build_control(void)
 {
     s_control = lv_obj_create(NULL);
@@ -2332,6 +2712,7 @@ static void update_snapshot(const codex_snapshot_t *snapshot)
     else lv_obj_add_flag(s_dotii_quick, LV_OBJ_FLAG_HIDDEN);
     render_dotii_expression();
     update_page_dots();
+    render_agents(false);
 
     if ((s_current == s_main || s_current == s_plus_main) && s_current != page_screen(0)) {
         load_screen(page_screen(0), false);
@@ -2403,6 +2784,7 @@ void state_ui_start(QueueHandle_t snapshot_queue)
     build_bambu();
     build_custom();
     build_dotii();
+    build_agents();
     build_settings();
     build_control();
     build_power();
@@ -2441,7 +2823,7 @@ void state_ui_button_a_short(void)
     }
     int current_page = (s_current == s_main || s_current == s_plus_main) ? 0 :
         s_current == s_bambu_main ? 1 : s_current == s_custom ? 2 :
-        s_current == s_dotii ? 3 : -1;
+        s_current == s_dotii ? 3 : s_current == s_agents ? 4 : -1;
     if (current_page < 0) {
         load_screen(first_enabled_screen(), true);
         return;

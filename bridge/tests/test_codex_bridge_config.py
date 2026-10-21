@@ -16,6 +16,7 @@ from codex_bridge import (  # noqa: E402
     dotii_state,
     packaged_startup_command,
     startup_command,
+    board_agents,
     validate_display_config,
     validate_dotii_config,
     validate_module_config,
@@ -328,3 +329,64 @@ class CodexUiConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScreenStyleConfigTests(unittest.TestCase):
+    def test_display_config_defaults_to_list_style(self) -> None:
+        self.assertEqual(validate_display_config(None)["screen_style"], "list")
+
+    def test_display_config_accepts_known_screen_styles(self) -> None:
+        for style in ("list", "rings", "carousel"):
+            self.assertEqual(
+                validate_display_config({"screen_style": style})["screen_style"], style)
+
+    def test_display_config_rejects_unknown_screen_style(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_display_config({"screen_style": "grid"})
+
+
+class BoardAgentsTests(unittest.TestCase):
+    def _snap(self, providers):
+        return {"providers": providers, "generated_at_epoch": 0}
+
+    def test_only_enabled_agents_included(self) -> None:
+        agents = board_agents(self._snap([
+            {"id": "grok", "name": "Grok", "status": "ok", "enabled": True,
+             "used_percent": 20, "windows": [
+                 {"id": "w", "label": "周", "used_percent": 20.0, "reset_at_epoch": 10}]},
+            {"id": "qoder", "name": "Qoder", "status": "unavailable", "enabled": False},
+        ]))
+        self.assertEqual([a["id"] for a in agents], ["grok"])
+        a = agents[0]
+        self.assertEqual((a["nm"], a["st"], a["up"]), ("Grok", "ok", 20))
+        self.assertEqual(a["w"], [{"l": "周", "u": 20.0, "r": 10}])
+
+    def test_windows_sorted_most_constraining_first_capped_two(self) -> None:
+        agents = board_agents(self._snap([
+            {"id": "ag", "name": "Antigravity", "status": "ok", "enabled": True,
+             "used_percent": 93, "windows": [
+                 {"label": "Gemini", "used_percent": 7.9, "reset_at_epoch": 1},
+                 {"label": "Claude", "used_percent": 93.4, "reset_at_epoch": 2},
+                 {"label": "Extra", "used_percent": 50.0, "reset_at_epoch": 3}]},
+        ]))
+        labels = [w["l"] for w in agents[0]["w"]]
+        self.assertEqual(labels, ["Claude", "Extra"])
+
+    def test_signed_out_agent_carries_status_and_message_not_quota(self) -> None:
+        agents = board_agents(self._snap([
+            {"id": "kimi", "name": "Kimi Code", "status": "auth_error", "enabled": True,
+             "detail": "Kimi Code 登录已过期", "windows": []},
+        ]))
+        a = agents[0]
+        self.assertEqual(a["st"], "auth_error")
+        self.assertNotIn("up", a)
+        self.assertNotIn("w", a)
+        self.assertIn("msg", a)
+
+    def test_board_agents_bounded_to_eight(self) -> None:
+        providers = [{"id": f"a{i}", "name": f"A{i}", "status": "ok", "enabled": True,
+                      "used_percent": i} for i in range(12)]
+        self.assertEqual(len(board_agents(self._snap(providers))), 8)
+
+    def test_non_dict_snapshot_returns_empty(self) -> None:
+        self.assertEqual(board_agents(None), [])

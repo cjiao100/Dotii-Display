@@ -501,6 +501,15 @@ function setUiSelectValue(id, value, dispatch = false) {
   }
 }
 
+function updateStylePreview() {
+  const value = byId("screen-style")?.value;
+  document.querySelectorAll(".style-preview-item").forEach((item) => {
+    const active = item.dataset.styleValue === value;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
+}
+
 function refreshTimeoutConstraints() {
   DISPLAY_TIMEOUT_PAIRS.forEach(({ screenOff: screenOffId, sleep: sleepId }) => {
     const screenOff = Number(byId(screenOffId).value);
@@ -1302,6 +1311,9 @@ function renderOverview(overview) {
     setUiSelectValue("charging-sleep-timeout", chargingSleepTimeout);
     setUiSelectValue("screen-off-page", ["none", "custom", "dotii"].includes(displayConfig.screen_off_page)
       ? displayConfig.screen_off_page : "none");
+    setUiSelectValue("screen-style", ["list", "rings", "carousel"].includes(displayConfig.screen_style)
+      ? displayConfig.screen_style : "list");
+    updateStylePreview();
     refreshTimeoutConstraints();
     setText("dock-angle-output", `${angle.toFixed(1)}°`);
     setText("display-save-state", t("已同步到 Dotii 管理中心"));
@@ -1471,6 +1483,7 @@ async function saveDisplaySettings(event) {
   const chargingScreenOffTimeoutSeconds = Number(byId("charging-screen-off-timeout").value);
   const chargingSleepTimeoutSeconds = Number(byId("charging-sleep-timeout").value);
   const screenOffPage = byId("screen-off-page").value;
+  const screenStyle = byId("screen-style").value;
   try {
     const response = await fetch("/api/v1/admin/display", {
       method: "POST",
@@ -1482,6 +1495,7 @@ async function saveDisplaySettings(event) {
         charging_screen_off_timeout_seconds: chargingScreenOffTimeoutSeconds,
         charging_sleep_timeout_seconds: chargingSleepTimeoutSeconds,
         screen_off_page: screenOffPage,
+        screen_style: screenStyle,
       }),
     });
     const result = await response.json();
@@ -1929,6 +1943,15 @@ byId("screen-off-page").addEventListener("change", () => {
   state.displayDirty = true;
   setText("display-save-state", t("有尚未保存的修改"));
 });
+document.querySelectorAll(".style-preview-item").forEach((item) => {
+  item.addEventListener("click", () => setUiSelectValue("screen-style", item.dataset.styleValue, true));
+});
+byId("screen-style").addEventListener("change", () => {
+  state.displayDirty = true;
+  setText("display-save-state", t("有尚未保存的修改"));
+  updateStylePreview();
+});
+updateStylePreview();
 byId("codex-enabled").addEventListener("change", (event) => updateModule("codex", event.target.checked));
 byId("codex-ui").addEventListener("change", (event) => saveCodexUi(event.target.value));
 byId("codex-check").addEventListener("click", checkCodex);
